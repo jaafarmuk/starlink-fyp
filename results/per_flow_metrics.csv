@@ -1,0 +1,5 @@
+flow_index,src_node,dst_node,port,throughput_mbps,mean_delay_ms,loss_rate_percent,tx_packets,rx_packets,lost_packets
+0,27,31,9000,7.39913,3.412,0,9000,8997,0
+3,27,34,9003,7.38433,21.236,0,9000,8979,0
+1,31,34,9001,7.38433,21.824,0,9000,8979,0
+2,34,35,9002,7.38926,15.412,0,9000,8985,0
