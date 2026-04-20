@@ -372,7 +372,7 @@ int main(int argc, char *argv[])
     {
       double x = (i % 10) * 50.0;
       double y = (i / 10) * 50.0;
-      anim->SetConstantPosition(nodes.Get(i), x, y);
+      AnimationInterface::SetConstantPosition(nodes.Get(i), x, y);
       anim->UpdateNodeDescription(nodes.Get(i), "Sat-" + std::to_string(i));
     }
   }
