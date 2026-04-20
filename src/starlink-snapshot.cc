@@ -13,6 +13,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <limits>
 #include <queue>
 #include <memory>
 #include <map>
@@ -42,7 +43,9 @@ struct PerFlowRow
   uint16_t port;
   double throughputMbps;
   double meanDelayMs;
+  double meanJitterMs;
   double lossRatePercent;
+  uint32_t hopCount;
   uint64_t txPackets;
   uint64_t rxPackets;
   uint64_t lostPackets;
@@ -68,7 +71,7 @@ ComputeConnectedComponents(const std::vector<std::vector<uint32_t>>& adjacency)
 
   for (uint32_t start = 0; start < adjacency.size(); ++start)
   {
-    if (visited[start] || adjacency[start].empty())
+    if (visited[start])
     {
       continue;
     }
@@ -111,28 +114,71 @@ ComputeConnectedComponents(const std::vector<std::vector<uint32_t>>& adjacency)
   return components;
 }
 
-static std::vector<std::pair<uint32_t, uint32_t>>
-BuildFlowPairs(const std::vector<uint32_t>& candidateNodes, uint32_t numFlows)
+static uint32_t
+BfsShortestHops(const std::vector<std::vector<uint32_t>>& adjacency,
+                uint32_t src, uint32_t dst)
 {
-  std::vector<std::pair<uint32_t, uint32_t>> pairs;
-
-  if (candidateNodes.size() < 2 || numFlows == 0)
+  if (src == dst) return 0;
+  const uint32_t INF = std::numeric_limits<uint32_t>::max();
+  std::vector<uint32_t> dist(adjacency.size(), INF);
+  std::queue<uint32_t> q;
+  dist[src] = 0;
+  q.push(src);
+  while (!q.empty())
   {
-    return pairs;
+    uint32_t node = q.front(); q.pop();
+    for (uint32_t nbr : adjacency[node])
+    {
+      if (dist[nbr] == INF)
+      {
+        dist[nbr] = dist[node] + 1;
+        if (nbr == dst) return dist[nbr];
+        q.push(nbr);
+      }
+    }
+  }
+  return INF;
+}
+
+static std::vector<std::pair<uint32_t, uint32_t>>
+BuildFlowPairs(const std::vector<uint32_t>& candidateNodes,
+               uint32_t numFlows,
+               const std::vector<std::vector<uint32_t>>& adjacency)
+{
+  if (candidateNodes.size() < 2 || numFlows == 0)
+    return {};
+
+  const uint32_t INF = std::numeric_limits<uint32_t>::max();
+  std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> pairDists;
+
+  for (size_t i = 0; i < candidateNodes.size(); ++i)
+  {
+    for (size_t j = i + 1; j < candidateNodes.size(); ++j)
+    {
+      uint32_t src = candidateNodes[i];
+      uint32_t dst = candidateNodes[j];
+      uint32_t hops = BfsShortestHops(adjacency, src, dst);
+      if (hops != INF && hops > 0)
+        pairDists.push_back({src, dst, hops});
+    }
   }
 
-  for (size_t gap = 1; gap < candidateNodes.size() && pairs.size() < numFlows; ++gap)
+  std::sort(pairDists.begin(), pairDists.end(),
+            [](const auto& a, const auto& b) {
+              return std::get<2>(a) > std::get<2>(b);
+            });
+
+  std::vector<std::pair<uint32_t, uint32_t>> pairs;
+  for (const auto& entry : pairDists)
   {
-    for (size_t i = 0; i + gap < candidateNodes.size() && pairs.size() < numFlows; ++i)
-    {
-      pairs.push_back({candidateNodes[i], candidateNodes[i + gap]});
-    }
+    if (pairs.size() >= numFlows) break;
+    pairs.push_back({std::get<0>(entry), std::get<1>(entry)});
   }
 
   return pairs;
 }
 
-static std::vector<Edge> ReadEdgesCsv(const std::string &path, uint32_t &outN)
+static std::vector<Edge> ReadEdgesCsv(const std::string &path, uint32_t &outMaxId)
 {
   std::ifstream f(path);
   if (!f.is_open())
@@ -145,6 +191,7 @@ static std::vector<Edge> ReadEdgesCsv(const std::string &path, uint32_t &outN)
 
   std::vector<Edge> edges;
   uint32_t maxId = 0;
+  bool anyEdge = false;
 
   while (std::getline(f, line))
   {
@@ -164,16 +211,66 @@ static std::vector<Edge> ReadEdgesCsv(const std::string &path, uint32_t &outN)
     e.delayMs = std::stod(sdelay);
 
     maxId = std::max(maxId, std::max(e.u, e.v));
+    anyEdge = true;
     edges.push_back(e);
   }
 
-  outN = maxId + 1;
+  outMaxId = anyEdge ? maxId : 0;
   return edges;
+}
+
+static bool ReadNodesCsv(const std::string &path, uint32_t &outNodeCount)
+{
+  std::ifstream f(path);
+  if (!f.is_open())
+  {
+    return false;
+  }
+
+  std::string line;
+  if (!std::getline(f, line))
+  {
+    return false;
+  }
+
+  uint32_t maxId = 0;
+  uint32_t count = 0;
+  bool any = false;
+  while (std::getline(f, line))
+  {
+    if (line.empty()) continue;
+    std::stringstream ss(line);
+    std::string sid;
+    std::getline(ss, sid, ',');
+    try
+    {
+      uint32_t id = static_cast<uint32_t>(std::stoul(sid));
+      maxId = std::max(maxId, id);
+      any = true;
+      count++;
+    }
+    catch (const std::exception&)
+    {
+      continue;
+    }
+  }
+
+  if (!any)
+  {
+    return false;
+  }
+
+  // The node CSV assigns dense 0..N-1 ids, but we tolerate gaps by trusting
+  // the maximum id. Either way, the node count the ns-3 scenario should
+  // allocate is max(id)+1.
+  outNodeCount = std::max(count, maxId + 1);
+  return true;
 }
 
 int main(int argc, char *argv[])
 {
   std::string edgesPath = "results/snapshot_edges.csv";
+  std::string nodesPath = "results/snapshot_nodes.csv";
   double simTime = 10.0;
   std::string rate = "20Mbps";
   uint32_t numFlows = 4;
@@ -186,6 +283,7 @@ int main(int argc, char *argv[])
 
   CommandLine cmd;
   cmd.AddValue("edges", "CSV edge file", edgesPath);
+  cmd.AddValue("nodes", "CSV node file (authoritative node count)", nodesPath);
   cmd.AddValue("simTime", "Simulation time in seconds", simTime);
   cmd.AddValue("rate", "Link data rate", rate);
   cmd.AddValue("numFlows", "Number of UDP flows", numFlows);
@@ -198,8 +296,38 @@ int main(int argc, char *argv[])
   cmd.AddValue("perFlowOut", "CSV file for per-flow metrics", perFlowOut);
   cmd.Parse(argc, argv);
 
+  if (appStart >= simTime)
+  {
+    NS_FATAL_ERROR("appStart (" << appStart << ") must be < simTime (" << simTime << ")");
+  }
+  const double activeDuration = simTime - appStart;
+
+  uint32_t maxEdgeId = 0;
+  auto edges = ReadEdgesCsv(edgesPath, maxEdgeId);
+
   uint32_t N = 0;
-  auto edges = ReadEdgesCsv(edgesPath, N);
+  const bool nodesFromCsv = ReadNodesCsv(nodesPath, N);
+  if (nodesFromCsv)
+  {
+    if (!edges.empty() && maxEdgeId + 1 > N)
+    {
+      NS_FATAL_ERROR("Edges reference node id " << maxEdgeId
+                     << " but nodes CSV only declares " << N << " nodes");
+    }
+    std::cout << "Node count source: " << nodesPath << " (N=" << N << ")\n";
+  }
+  else
+  {
+    N = edges.empty() ? 0 : maxEdgeId + 1;
+    std::cout << "Node count source: edges-only fallback (N=" << N << ")\n";
+  }
+
+  if (N == 0)
+  {
+    NS_FATAL_ERROR("No nodes available; both " << nodesPath
+                   << " and " << edgesPath << " appear to be empty");
+  }
+
   auto adjacency = BuildAdjacency(N, edges);
 
   uint32_t activeNodes = 0;
@@ -307,7 +435,7 @@ int main(int argc, char *argv[])
     NS_FATAL_ERROR(msg.str());
   }
 
-  auto flowPairs = BuildFlowPairs(candidateNodes, numFlows);
+  auto flowPairs = BuildFlowPairs(candidateNodes, numFlows, adjacency);
 
   if (flowPairs.empty())
   {
@@ -402,18 +530,24 @@ int main(int argc, char *argv[])
     sumDelaySeconds += st.delaySum.GetSeconds();
     sumRxPkts += st.rxPackets;
 
-    double perFlowThroughputMbps = (st.rxBytes * 8.0) / simTime / 1e6;
+    double perFlowThroughputMbps = (st.rxBytes * 8.0) / activeDuration / 1e6;
     double perFlowLossRate = st.txPackets
                                  ? (static_cast<double>(st.lostPackets) / st.txPackets) * 100.0
                                  : 0.0;
     double perFlowMeanDelayMs =
         st.rxPackets ? (st.delaySum.GetSeconds() / st.rxPackets) * 1000.0 : 0.0;
+    double perFlowMeanJitterMs = (st.rxPackets > 1)
+        ? (st.jitterSum.GetSeconds() / (st.rxPackets - 1)) * 1000.0 : 0.0;
 
     const auto& flow = flowIt->second;
+    uint32_t hops = BfsShortestHops(adjacency, flow.srcNode, flow.dstNode);
+
     std::cout << "Flow " << flow.flowIndex
               << " route " << flow.srcNode << " -> " << flow.dstNode
+              << " (" << (hops == std::numeric_limits<uint32_t>::max() ? 0 : hops) << " hops)"
               << ": Throughput=" << perFlowThroughputMbps << " Mbps"
               << ", Mean Delay=" << perFlowMeanDelayMs << " ms"
+              << ", Jitter=" << perFlowMeanJitterMs << " ms"
               << ", Loss Rate=" << perFlowLossRate << " %\n";
 
     perFlowRows.push_back({flow.flowIndex,
@@ -422,13 +556,15 @@ int main(int argc, char *argv[])
                            flow.port,
                            perFlowThroughputMbps,
                            perFlowMeanDelayMs,
+                           perFlowMeanJitterMs,
                            perFlowLossRate,
+                           (hops == std::numeric_limits<uint32_t>::max() ? 0u : hops),
                            st.txPackets,
                            st.rxPackets,
                            st.lostPackets});
   }
 
-  double throughputMbps = (totalRxBytes * 8.0) / simTime / 1e6;
+  double throughputMbps = (totalRxBytes * 8.0) / activeDuration / 1e6;
   double lossRate = totalTxPkts ? static_cast<double>(totalLostPkts) / totalTxPkts : 0.0;
   double meanDelayMs = sumRxPkts ? (sumDelaySeconds / sumRxPkts) * 1000.0 : 0.0;
 
@@ -443,8 +579,8 @@ int main(int argc, char *argv[])
     NS_FATAL_ERROR("Could not open per-flow CSV for writing: " << perFlowOut);
   }
 
-  perFlowCsv << "flow_index,src_node,dst_node,port,throughput_mbps,mean_delay_ms,loss_rate_percent,"
-                "tx_packets,rx_packets,lost_packets\n";
+  perFlowCsv << "flow_index,src_node,dst_node,port,throughput_mbps,mean_delay_ms,mean_jitter_ms,"
+                "loss_rate_percent,hop_count,tx_packets,rx_packets,lost_packets\n";
   for (const auto& row : perFlowRows)
   {
     perFlowCsv << row.flowIndex << ","
@@ -453,7 +589,9 @@ int main(int argc, char *argv[])
                << row.port << ","
                << row.throughputMbps << ","
                << row.meanDelayMs << ","
+               << row.meanJitterMs << ","
                << row.lossRatePercent << ","
+               << row.hopCount << ","
                << row.txPackets << ","
                << row.rxPackets << ","
                << row.lostPackets << "\n";

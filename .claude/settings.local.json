@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/tle_to_snapshot.py --tle datasets/starlink.tle --edges_out results/snapshot_edges.csv --nodes_out results/snapshot_nodes.csv --n 60)",
+      "Bash(python -m pip install sgp4 numpy pandas --quiet)",
+      "Bash(python -m pip install matplotlib --quiet)",
+      "Bash(python tools/plot_flow_metrics.py)"
+    ]
+  }
+}

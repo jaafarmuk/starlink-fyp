@@ -1,6 +1,8 @@
 import argparse
 import math
+import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -9,6 +11,35 @@ from sgp4.api import Satrec
 
 EARTH_RADIUS_KM = 6371.0
 C_KM_S = 299792.458
+
+# LEO sanity band for Starlink-like constellations. Altitudes below ~150 km
+# decay very quickly, and Starlink operates well below 2500 km. Any SGP4
+# output outside this band is almost certainly a numerical blow-up caused by
+# propagating far from the TLE epoch.
+MIN_ALTITUDE_KM = 150.0
+MAX_ALTITUDE_KM = 2500.0
+MIN_RADIUS_KM = EARTH_RADIUS_KM + MIN_ALTITUDE_KM
+MAX_RADIUS_KM = EARTH_RADIUS_KM + MAX_ALTITUDE_KM
+
+
+def utc_to_jd(utc_iso):
+    """Convert an ISO-8601 UTC string (e.g. '2026-03-21T12:00:00') to (jd, fr)."""
+    dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+
+    y, m, d = dt.year, dt.month, dt.day
+    if m <= 2:
+        y -= 1
+        m += 12
+    a = y // 100
+    b = 2 - a + a // 4
+    jd_day = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + d + b - 1524
+    # JD at 0h UT
+    jd0 = float(jd_day) - 0.5
+    frac = (dt.hour + dt.minute / 60.0 + (dt.second + dt.microsecond / 1e6) / 3600.0) / 24.0
+    return jd0, frac
 
 
 def read_tles(path):
@@ -188,23 +219,71 @@ def main():
     ap.add_argument("--nodes_out", default="results/snapshot_nodes.csv")
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--max_km", type=float, default=5000.0)
-    ap.add_argument("--jd", type=float, default=2460000.5)
-    ap.add_argument("--fr", type=float, default=0.0)
+    ap.add_argument(
+        "--utc",
+        default=None,
+        help="UTC timestamp (ISO-8601) to propagate all satellites to. "
+             "If omitted, each satellite is evaluated at its own TLE epoch.",
+    )
+    ap.add_argument("--jd", type=float, default=None,
+                    help="Override Julian day (advanced). Used together with --fr.")
+    ap.add_argument("--fr", type=float, default=0.0,
+                    help="Fractional day offset for --jd (advanced).")
 
     ap.add_argument("--max_degree", type=int, default=4)
     ap.add_argument("--intra_plane", type=int, default=2)
     ap.add_argument("--inter_plane", type=int, default=2)
     ap.add_argument("--raan_tol_deg", type=float, default=5.0)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Optional seed for deterministic TLE sampling.")
+    ap.add_argument("--sample", choices=["head", "random"], default="head",
+                    help="How to select --n TLEs from the dataset.")
+    ap.add_argument("--stats_out", default="results/topology_stats.csv",
+                    help="CSV file to write topology summary statistics into.")
 
     args = ap.parse_args()
 
-    raw_sats = read_tles(args.tle)[:args.n]
+    # Resolve propagation epoch policy.
+    common_jd = None
+    common_fr = None
+    epoch_mode = "tle"
+    if args.jd is not None:
+        common_jd = float(args.jd)
+        common_fr = float(args.fr)
+        epoch_mode = f"jd={common_jd}+{common_fr}"
+    elif args.utc is not None:
+        common_jd, common_fr = utc_to_jd(args.utc)
+        epoch_mode = f"utc={args.utc}"
+
+    all_tles = read_tles(args.tle)
+    if args.sample == "random":
+        rng = np.random.default_rng(args.seed)
+        idx = rng.choice(len(all_tles), size=min(args.n, len(all_tles)), replace=False)
+        raw_sats = [all_tles[i] for i in sorted(idx.tolist())]
+    else:
+        raw_sats = all_tles[:args.n]
+
     satrecs = [Satrec.twoline2rv(l1, l2) for _, l1, l2 in raw_sats]
 
     sats = []
+    rejected_sgp4 = 0
+    rejected_altitude = 0
     for i, ((name, l1, l2), s) in enumerate(zip(raw_sats, satrecs)):
-        e, r, _ = s.sgp4(args.jd, args.fr)
+        if common_jd is None:
+            jd_eval = s.jdsatepoch
+            fr_eval = s.jdsatepochF
+        else:
+            jd_eval = common_jd
+            fr_eval = common_fr
+
+        e, r, _ = s.sgp4(jd_eval, fr_eval)
         if e != 0:
+            rejected_sgp4 += 1
+            continue
+
+        radius = float(np.linalg.norm(r))
+        if not (MIN_RADIUS_KM <= radius <= MAX_RADIUS_KM):
+            rejected_altitude += 1
             continue
 
         try:
@@ -322,11 +401,83 @@ def main():
     pd.DataFrame(edge_rows).to_csv(args.edges_out, index=False)
     pd.DataFrame(node_rows).to_csv(args.nodes_out, index=False)
 
+    # Connectivity stats (approximate, via BFS over undirected graph).
+    adj = defaultdict(list)
+    for a, b, _, _ in edges:
+        adj[a].append(b)
+        adj[b].append(a)
+
+    visited = set()
+    largest = 0
+    for sid in (sat["id"] for sat in sats):
+        if sid in visited:
+            continue
+        stack = [sid]
+        size = 0
+        while stack:
+            x = stack.pop()
+            if x in visited:
+                continue
+            visited.add(x)
+            size += 1
+            stack.extend(adj[x])
+        if size > largest:
+            largest = size
+
+    isolated = sum(1 for sat in sats if degree[sat["id"]] == 0)
+
+    print(f"Epoch mode: {epoch_mode}")
+    print(f"Requested TLEs: {len(raw_sats)}")
+    print(f"Rejected (SGP4 error): {rejected_sgp4}")
+    print(f"Rejected (altitude out of LEO band): {rejected_altitude}")
     print(f"Valid satellites: {N}")
     print(f"Planes: {len(planes)}")
     print(f"Edges: {len(edge_rows)}")
+    print(f"Isolated nodes: {isolated}")
+    print(f"Largest connected component: {largest} / {N}")
+    mean_isl_km = sum(d for _, _, d, _ in edges) / len(edges) if edges else 0.0
+    max_isl_km = max((d for _, _, d, _ in edges), default=0.0)
+    mean_deg = sum(degree.values()) / N if N > 0 else 0.0
+    max_deg = max(degree.values()) if degree else 0
+
+    pd.DataFrame([{
+        "num_nodes": N,
+        "num_edges": len(edge_rows),
+        "num_planes": len(planes),
+        "isolated_nodes": isolated,
+        "largest_cc_size": largest,
+        "mean_degree": round(mean_deg, 3),
+        "max_degree": max_deg,
+        "mean_isl_distance_km": round(mean_isl_km, 1),
+        "max_isl_distance_km": round(max_isl_km, 1),
+    }]).to_csv(args.stats_out, index=False)
+
     print(f"Wrote {args.edges_out}")
     print(f"Wrote {args.nodes_out}")
+    print(f"Wrote {args.stats_out}")
+
+    # Warnings. Written to stderr so they stand out but do not break pipelines.
+    if rejected_altitude > 0:
+        print(
+            f"WARNING: {rejected_altitude} satellite(s) rejected for unrealistic "
+            f"altitude. Consider using --utc near the TLE epoch, or refreshing "
+            f"the TLE dataset.",
+            file=sys.stderr,
+        )
+    if N > 0 and isolated / N > 0.25:
+        print(
+            f"WARNING: {isolated}/{N} satellites have no links "
+            f"({isolated / N:.0%}). The topology is sparse; consider relaxing "
+            f"--max_km or raising --max_degree.",
+            file=sys.stderr,
+        )
+    if N > 0 and largest / N < 0.5:
+        print(
+            f"WARNING: largest connected component covers only "
+            f"{largest}/{N} nodes ({largest / N:.0%}). Flow generation in the "
+            f"ns-3 scenario will only use that component.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
