@@ -279,6 +279,7 @@ int main(int argc, char *argv[])
   double intervalMs = 1.0;
   uint32_t queuePackets = 20;
   bool enableAnim = true;
+  bool useTcp = false;
   std::string perFlowOut = "results/per_flow_metrics.csv";
 
   CommandLine cmd;
@@ -286,13 +287,15 @@ int main(int argc, char *argv[])
   cmd.AddValue("nodes", "CSV node file (authoritative node count)", nodesPath);
   cmd.AddValue("simTime", "Simulation time in seconds", simTime);
   cmd.AddValue("rate", "Link data rate", rate);
-  cmd.AddValue("numFlows", "Number of UDP flows", numFlows);
+  cmd.AddValue("numFlows", "Number of flows", numFlows);
   cmd.AddValue("appStart", "Traffic start time in seconds", appStart);
-  cmd.AddValue("packetSize", "UDP packet size in bytes", packetSize);
-  cmd.AddValue("intervalMs", "Packet interval in milliseconds", intervalMs);
+  cmd.AddValue("packetSize", "Packet/segment size in bytes", packetSize);
+  cmd.AddValue("intervalMs", "UDP packet interval in milliseconds (ignored when useTcp=true)",
+               intervalMs);
   cmd.AddValue("queuePackets", "DropTailQueue size in packets per point-to-point device",
                queuePackets);
   cmd.AddValue("enableAnim", "Enable NetAnim XML output", enableAnim);
+  cmd.AddValue("useTcp", "Use TCP BulkSend instead of UDP CBR", useTcp);
   cmd.AddValue("perFlowOut", "CSV file for per-flow metrics", perFlowOut);
   cmd.Parse(argc, argv);
 
@@ -454,6 +457,8 @@ int main(int argc, char *argv[])
   }
   std::cout << "\n";
 
+  std::cout << "Transport: " << (useTcp ? "TCP (BulkSend)" : "UDP (CBR)") << "\n";
+
   uint16_t basePort = 9000;
   std::vector<AppFlow> appFlows;
 
@@ -463,20 +468,38 @@ int main(int argc, char *argv[])
     uint32_t dst = flowPairs[i].second;
     uint16_t port = basePort + i;
 
-    PacketSinkHelper sink("ns3::UdpSocketFactory",
-                          InetSocketAddress(Ipv4Address::GetAny(), port));
-    ApplicationContainer sinkApp = sink.Install(nodes.Get(dst));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(simTime));
+    if (useTcp)
+    {
+      PacketSinkHelper sink("ns3::TcpSocketFactory",
+                            InetSocketAddress(Ipv4Address::GetAny(), port));
+      ApplicationContainer sinkApp = sink.Install(nodes.Get(dst));
+      sinkApp.Start(Seconds(0.0));
+      sinkApp.Stop(Seconds(simTime));
 
-    UdpClientHelper client(nodeAddr[dst], port);
-    client.SetAttribute("MaxPackets", UintegerValue(0));
-    client.SetAttribute("Interval", TimeValue(MilliSeconds(intervalMs)));
-    client.SetAttribute("PacketSize", UintegerValue(packetSize));
+      BulkSendHelper source("ns3::TcpSocketFactory",
+                            InetSocketAddress(nodeAddr[dst], port));
+      source.SetAttribute("MaxBytes", UintegerValue(0));
+      source.SetAttribute("SendSize", UintegerValue(packetSize));
+      ApplicationContainer sourceApp = source.Install(nodes.Get(src));
+      sourceApp.Start(Seconds(appStart));
+      sourceApp.Stop(Seconds(simTime));
+    }
+    else
+    {
+      PacketSinkHelper sink("ns3::UdpSocketFactory",
+                            InetSocketAddress(Ipv4Address::GetAny(), port));
+      ApplicationContainer sinkApp = sink.Install(nodes.Get(dst));
+      sinkApp.Start(Seconds(0.0));
+      sinkApp.Stop(Seconds(simTime));
 
-    ApplicationContainer clientApp = client.Install(nodes.Get(src));
-    clientApp.Start(Seconds(appStart));
-    clientApp.Stop(Seconds(simTime));
+      UdpClientHelper client(nodeAddr[dst], port);
+      client.SetAttribute("MaxPackets", UintegerValue(0));
+      client.SetAttribute("Interval", TimeValue(MilliSeconds(intervalMs)));
+      client.SetAttribute("PacketSize", UintegerValue(packetSize));
+      ApplicationContainer clientApp = client.Install(nodes.Get(src));
+      clientApp.Start(Seconds(appStart));
+      clientApp.Stop(Seconds(simTime));
+    }
 
     appFlows.push_back({i, src, dst, port});
 
@@ -496,6 +519,7 @@ int main(int argc, char *argv[])
   Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(fm.GetClassifier());
 
   double totalRxBytes = 0.0;
+  double totalTxBytes = 0.0;
   uint64_t totalTxPkts = 0;
   uint64_t totalLostPkts = 0;
   double sumDelaySeconds = 0.0;
@@ -525,15 +549,19 @@ int main(int argc, char *argv[])
 
     const auto &st = kv.second;
     totalRxBytes += st.rxBytes;
+    totalTxBytes += st.txBytes;
     totalTxPkts += st.txPackets;
     totalLostPkts += st.lostPackets;
     sumDelaySeconds += st.delaySum.GetSeconds();
     sumRxPkts += st.rxPackets;
 
     double perFlowThroughputMbps = (st.rxBytes * 8.0) / activeDuration / 1e6;
-    double perFlowLossRate = st.txPackets
-                                 ? (static_cast<double>(st.lostPackets) / st.txPackets) * 100.0
+    // For TCP, lostPackets counts retransmissions, not application-level loss.
+    // Use byte-level delivery ratio instead to get a meaningful metric for both modes.
+    double perFlowLossRate = st.txBytes
+                                 ? (1.0 - static_cast<double>(st.rxBytes) / st.txBytes) * 100.0
                                  : 0.0;
+    if (perFlowLossRate < 0.0) perFlowLossRate = 0.0;
     double perFlowMeanDelayMs =
         st.rxPackets ? (st.delaySum.GetSeconds() / st.rxPackets) * 1000.0 : 0.0;
     double perFlowMeanJitterMs = (st.rxPackets > 1)
@@ -565,7 +593,7 @@ int main(int argc, char *argv[])
   }
 
   double throughputMbps = (totalRxBytes * 8.0) / activeDuration / 1e6;
-  double lossRate = totalTxPkts ? static_cast<double>(totalLostPkts) / totalTxPkts : 0.0;
+  double lossRate = totalTxBytes ? std::max(0.0, 1.0 - totalRxBytes / totalTxBytes) : 0.0;
   double meanDelayMs = sumRxPkts ? (sumDelaySeconds / sumRxPkts) * 1000.0 : 0.0;
 
   std::cout << "\n=== OVERALL RESULTS ===\n";
