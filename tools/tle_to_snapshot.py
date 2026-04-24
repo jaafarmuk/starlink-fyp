@@ -1,29 +1,75 @@
+"""
+Starlink / LEO TLE -> network snapshot generator.
+
+Design goals (addresses items 1-9, 24-30 of the review):
+  * Every satellite is propagated to ONE common epoch. --utc is the default
+    policy (median TLE epoch if omitted). Per-satellite epoch mode is opt-in
+    and emits a warning because it is physically inconsistent for a topology.
+  * Plane/shell grouping is derived from propagated orbital elements at the
+    evaluation epoch (inclination + RAAN + semi-major axis), never from stale
+    TLE text fields.
+  * Plane clustering uses inclination+altitude to define a SHELL, then RAAN
+    within a shell. RAAN statistics are computed with circular means.
+  * Clustering uses a center-based rule with true angular tolerance, not
+    single-linkage chaining over sorted neighbours.
+  * In-plane ordering uses argument of latitude (u = omega + nu) — a real
+    along-track orbital coordinate — not ECI atan2(y,x).
+  * Inter-plane ISL candidates are restricted to the SAME SHELL, with
+    configurable plane offsets, range, elevation, and latitude constraints
+    (seam avoidance for inclined shells).
+  * Link delay reported is propagation-only. Serialization / queueing live
+    in the ns-3 scenario. This is stated in the generated metadata.
+  * ECI->ECEF (via GMST) is computed so that ground gateways can be added.
+  * Multi-epoch output is supported; a single snapshot is the default but
+    the topology is time-varying in reality, so the metadata records which
+    epoch (and how many) were generated.
+  * A metadata.json sidecar records schema version, epoch, generator params
+    and validation results so downstream tools can detect incompatibilities.
+  * The generator refuses to silently emit an obviously-wrong topology:
+    isolation, fragmentation, shell-count, and ISL-length distributions are
+    validated against configurable thresholds.
+"""
+
+from __future__ import annotations
+
 import argparse
+import json
 import math
+import os
 import sys
-from collections import defaultdict
+import tempfile
+from collections import Counter, defaultdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from sgp4.api import Satrec
 
 
-EARTH_RADIUS_KM = 6371.0
+SCHEMA_VERSION = "2.0.0"
+
+EARTH_RADIUS_KM = 6378.137            # WGS84 equatorial radius
+EARTH_FLATTENING = 1.0 / 298.257223563
+EARTH_MU_KM3_S2 = 398600.4418
+OMEGA_EARTH_RAD_S = 7.2921150e-5
 C_KM_S = 299792.458
 
-# LEO sanity band for Starlink-like constellations. Altitudes below ~150 km
-# decay very quickly, and Starlink operates well below 2500 km. Any SGP4
-# output outside this band is almost certainly a numerical blow-up caused by
-# propagating far from the TLE epoch.
+# LEO sanity band. Starlink is below ~1200 km; we keep a wide band so the
+# validator can still see gross SGP4 blow-ups but legitimate orbits pass.
 MIN_ALTITUDE_KM = 150.0
 MAX_ALTITUDE_KM = 2500.0
 MIN_RADIUS_KM = EARTH_RADIUS_KM + MIN_ALTITUDE_KM
 MAX_RADIUS_KM = EARTH_RADIUS_KM + MAX_ALTITUDE_KM
 
 
-def utc_to_jd(utc_iso):
-    """Convert an ISO-8601 UTC string (e.g. '2026-03-21T12:00:00') to (jd, fr)."""
+# ---------------------------------------------------------------------------
+# Time / coordinate helpers
+# ---------------------------------------------------------------------------
+
+def utc_to_jd(utc_iso: str) -> tuple[float, float]:
+    """ISO-8601 UTC -> (jd_integer_part_at_0h, fractional_day)."""
     dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -36,448 +82,1181 @@ def utc_to_jd(utc_iso):
     a = y // 100
     b = 2 - a + a // 4
     jd_day = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + d + b - 1524
-    # JD at 0h UT
     jd0 = float(jd_day) - 0.5
     frac = (dt.hour + dt.minute / 60.0 + (dt.second + dt.microsecond / 1e6) / 3600.0) / 24.0
     return jd0, frac
 
 
-def read_tles(path):
-    lines = [l.strip() for l in open(path, "r", encoding="utf-8", errors="ignore") if l.strip()]
+def jd_to_iso(jd: float, fr: float) -> str:
+    """(jd, fr) -> ISO-8601 UTC string (best-effort, for metadata)."""
+    jdn = jd + fr + 0.5
+    Z = math.floor(jdn)
+    F = jdn - Z
+    if Z < 2299161:
+        A = Z
+    else:
+        alpha = math.floor((Z - 1867216.25) / 36524.25)
+        A = Z + 1 + alpha - math.floor(alpha / 4)
+    B = A + 1524
+    C = math.floor((B - 122.1) / 365.25)
+    D = math.floor(365.25 * C)
+    E = math.floor((B - D) / 30.6001)
+
+    day = B - D - math.floor(30.6001 * E) + F
+    month = E - 1 if E < 14 else E - 13
+    year = C - 4716 if month > 2 else C - 4715
+
+    d_int = int(math.floor(day))
+    frac_day = day - d_int
+    total_sec = frac_day * 86400.0
+    hh = int(total_sec // 3600)
+    mm = int((total_sec % 3600) // 60)
+    ss = total_sec - hh * 3600 - mm * 60
+    return f"{year:04d}-{month:02d}-{d_int:02d}T{hh:02d}:{mm:02d}:{ss:06.3f}Z"
+
+
+def gmst_rad(jd: float, fr: float) -> float:
+    """Greenwich Mean Sidereal Time (radians) at UT1~=UTC, IAU 1982 approx."""
+    jd_ut1 = jd + fr
+    T = (jd_ut1 - 2451545.0) / 36525.0
+    gmst_sec = (67310.54841
+                + (876600.0 * 3600.0 + 8640184.812866) * T
+                + 0.093104 * T * T
+                - 6.2e-6 * T * T * T)
+    gmst_sec = math.fmod(gmst_sec, 86400.0)
+    if gmst_sec < 0:
+        gmst_sec += 86400.0
+    return (gmst_sec / 86400.0) * 2.0 * math.pi
+
+
+def eci_to_ecef(r_eci_km: np.ndarray, jd: float, fr: float) -> np.ndarray:
+    """Rotate ECI (TEME, good enough for LEO topology) to ECEF."""
+    theta = gmst_rad(jd, fr)
+    c, s = math.cos(theta), math.sin(theta)
+    R = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+    return R @ np.asarray(r_eci_km, dtype=float)
+
+
+def ecef_to_geodetic(r_ecef_km: np.ndarray) -> tuple[float, float, float]:
+    """ECEF -> (lat_deg, lon_deg, alt_km). WGS84 iterative."""
+    x, y, z = r_ecef_km
+    a = EARTH_RADIUS_KM
+    f = EARTH_FLATTENING
+    e2 = f * (2 - f)
+    b = a * (1 - f)
+
+    lon = math.atan2(y, x)
+    p = math.hypot(x, y)
+    if p < 1e-9:
+        lat = math.copysign(math.pi / 2.0, z)
+        alt = abs(z) - b
+        return math.degrees(lat), math.degrees(lon), alt
+
+    lat = math.atan2(z, p * (1 - e2))
+    for _ in range(8):
+        sin_lat = math.sin(lat)
+        N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
+        alt = p / math.cos(lat) - N
+        lat_new = math.atan2(z, p * (1 - e2 * N / (N + alt)))
+        if abs(lat_new - lat) < 1e-12:
+            lat = lat_new
+            break
+        lat = lat_new
+    sin_lat = math.sin(lat)
+    N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
+    alt = p / math.cos(lat) - N
+    return math.degrees(lat), math.degrees(lon), alt
+
+
+def geodetic_to_ecef(lat_deg: float, lon_deg: float, alt_km: float) -> np.ndarray:
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    a = EARTH_RADIUS_KM
+    f = EARTH_FLATTENING
+    e2 = f * (2 - f)
+    N = a / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+    x = (N + alt_km) * math.cos(lat) * math.cos(lon)
+    y = (N + alt_km) * math.cos(lat) * math.sin(lon)
+    z = (N * (1 - e2) + alt_km) * math.sin(lat)
+    return np.array([x, y, z], dtype=float)
+
+
+def ecef_to_eci(r_ecef_km: np.ndarray, jd: float, fr: float) -> np.ndarray:
+    theta = gmst_rad(jd, fr)
+    c, s = math.cos(theta), math.sin(theta)
+    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return R @ np.asarray(r_ecef_km, dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Circular statistics
+# ---------------------------------------------------------------------------
+
+def circ_mean_deg(values_deg) -> float:
+    if len(values_deg) == 0:
+        return 0.0
+    rad = np.radians(np.asarray(values_deg, dtype=float))
+    mx = np.mean(np.cos(rad))
+    my = np.mean(np.sin(rad))
+    mean = math.degrees(math.atan2(my, mx))
+    return mean % 360.0
+
+
+def ang_diff_deg(a: float, b: float) -> float:
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+# ---------------------------------------------------------------------------
+# Orbital elements from state vectors
+# ---------------------------------------------------------------------------
+
+def classical_elements(r_eci_km: np.ndarray,
+                       v_eci_km_s: np.ndarray) -> dict:
+    """Convert (r, v) in ECI to classical Keplerian elements.
+
+    Returns degrees for all angles.
+    """
+    r = np.asarray(r_eci_km, dtype=float)
+    v = np.asarray(v_eci_km_s, dtype=float)
+    r_mag = np.linalg.norm(r)
+    v_mag = np.linalg.norm(v)
+
+    h = np.cross(r, v)
+    h_mag = np.linalg.norm(h)
+
+    K = np.array([0.0, 0.0, 1.0])
+    n = np.cross(K, h)
+    n_mag = np.linalg.norm(n)
+
+    e_vec = (np.cross(v, h) / EARTH_MU_KM3_S2) - r / r_mag
+    e = float(np.linalg.norm(e_vec))
+
+    energy = 0.5 * v_mag * v_mag - EARTH_MU_KM3_S2 / r_mag
+    a = -EARTH_MU_KM3_S2 / (2.0 * energy) if abs(energy) > 1e-12 else float("inf")
+
+    i = math.degrees(math.acos(max(-1.0, min(1.0, h[2] / h_mag))))
+
+    if n_mag > 1e-9:
+        raan = math.degrees(math.acos(max(-1.0, min(1.0, n[0] / n_mag))))
+        if n[1] < 0.0:
+            raan = 360.0 - raan
+    else:
+        raan = 0.0  # equatorial
+
+    if n_mag > 1e-9 and e > 1e-9:
+        argp = math.degrees(math.acos(
+            max(-1.0, min(1.0, float(np.dot(n, e_vec)) / (n_mag * e)))
+        ))
+        if e_vec[2] < 0.0:
+            argp = 360.0 - argp
+    else:
+        argp = 0.0
+
+    if e > 1e-9:
+        nu = math.degrees(math.acos(
+            max(-1.0, min(1.0, float(np.dot(e_vec, r)) / (e * r_mag)))
+        ))
+        if float(np.dot(r, v)) < 0.0:
+            nu = 360.0 - nu
+    else:
+        # Circular orbit: use argument of latitude directly.
+        if n_mag > 1e-9:
+            u_tmp = math.degrees(math.acos(
+                max(-1.0, min(1.0, float(np.dot(n, r)) / (n_mag * r_mag)))
+            ))
+            if r[2] < 0.0:
+                u_tmp = 360.0 - u_tmp
+            nu = u_tmp
+            argp = 0.0
+        else:
+            nu = math.degrees(math.atan2(r[1], r[0])) % 360.0
+            argp = 0.0
+
+    u = (argp + nu) % 360.0
+
+    return {
+        "a_km": float(a),
+        "e": float(e),
+        "i_deg": float(i),
+        "raan_deg": float(raan % 360.0),
+        "argp_deg": float(argp),
+        "nu_deg": float(nu),
+        "u_deg": float(u),
+    }
+
+
+# ---------------------------------------------------------------------------
+# TLE parsing
+# ---------------------------------------------------------------------------
+
+def read_tles(path: str) -> list[tuple[str, str, str]]:
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip()]
     sats = []
     i = 0
     while i < len(lines):
-        if i + 2 < len(lines) and lines[i + 1].startswith("1 ") and lines[i + 2].startswith("2 "):
+        if (i + 2 < len(lines)
+                and lines[i + 1].startswith("1 ")
+                and lines[i + 2].startswith("2 ")):
             name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
             sats.append((name, l1, l2))
             i += 3
-        elif i + 1 < len(lines) and lines[i].startswith("1 ") and lines[i + 1].startswith("2 "):
+        elif (i + 1 < len(lines)
+                and lines[i].startswith("1 ")
+                and lines[i + 1].startswith("2 ")):
             l1, l2 = lines[i], lines[i + 1]
-            name = f"SAT_{len(sats)}"
-            sats.append((name, l1, l2))
+            sats.append((f"SAT_{len(sats)}", l1, l2))
             i += 2
         else:
             i += 1
     return sats
 
 
-def ang_diff_deg(a, b):
-    d = abs(a - b) % 360.0
-    return min(d, 360.0 - d)
+def tle_epoch_jd(satrec: Satrec) -> float:
+    return float(satrec.jdsatepoch) + float(satrec.jdsatepochF)
 
 
-def tle_raan_deg(line2):
-    # TLE line 2 columns 18-25 (1-based), so Python slice [17:25]
-    return float(line2[17:25].strip())
+# ---------------------------------------------------------------------------
+# Line-of-sight / distance
+# ---------------------------------------------------------------------------
 
-
-def has_line_of_sight(r1, r2, earth_radius_km=EARTH_RADIUS_KM):
-    r1 = np.array(r1, dtype=float)
-    r2 = np.array(r2, dtype=float)
+def has_line_of_sight(r1: np.ndarray,
+                      r2: np.ndarray,
+                      earth_radius_km: float = EARTH_RADIUS_KM) -> bool:
+    r1 = np.asarray(r1, dtype=float)
+    r2 = np.asarray(r2, dtype=float)
     d = r2 - r1
-    denom = np.dot(d, d)
-    if denom == 0:
+    denom = float(np.dot(d, d))
+    if denom == 0.0:
         return False
-
-    t = -np.dot(r1, d) / denom
+    t = -float(np.dot(r1, d)) / denom
     t = max(0.0, min(1.0, t))
     closest = r1 + t * d
-    return np.linalg.norm(closest) > earth_radius_km
+    return bool(np.linalg.norm(closest) > earth_radius_km)
 
 
-def distance_km(r1, r2):
+def distance_km(r1, r2) -> float:
     return float(np.linalg.norm(np.array(r1, dtype=float) - np.array(r2, dtype=float)))
 
 
-def cluster_planes(sats, raan_tol_deg):
+# ---------------------------------------------------------------------------
+# Shell + plane clustering (addresses review items 2, 3, 4, 5, 6)
+# ---------------------------------------------------------------------------
+
+def cluster_shells(sats: list[dict],
+                   inc_tol_deg: float,
+                   alt_tol_km: float) -> dict[int, list[int]]:
+    """Group satellites into physical shells by (inclination, altitude).
+
+    A 1-D hybrid clustering: inclination rounded to a bin then altitudes
+    inside each inclination bin grouped by contiguous tolerance. Altitude
+    is not angular, so no wrap-around handling is needed here.
     """
-    Group satellites into approximate orbital planes using RAAN proximity.
-    Returns:
-      planes: dict[plane_id] -> list of sat indices
-      plane_order: list of plane_ids sorted by mean RAAN
+    if not sats:
+        return {}
+
+    inc_bins: dict[int, list[int]] = defaultdict(list)
+    for s in sats:
+        key = int(round(s["i_deg"] / max(inc_tol_deg, 0.1)))
+        inc_bins[key].append(s["id"])
+
+    shells: dict[int, list[int]] = {}
+    shell_id = 0
+    for _, ids in sorted(inc_bins.items()):
+        alts = sorted(((sats[i]["alt_km"], i) for i in ids))
+        current: list[int] = [alts[0][1]]
+        cur_alt = alts[0][0]
+        for alt, sid in alts[1:]:
+            if abs(alt - cur_alt) <= alt_tol_km:
+                current.append(sid)
+                cur_alt = 0.5 * (cur_alt + alt)
+            else:
+                shells[shell_id] = current
+                shell_id += 1
+                current = [sid]
+                cur_alt = alt
+        shells[shell_id] = current
+        shell_id += 1
+    return shells
+
+
+def cluster_planes_in_shell(shell_sat_ids: list[int],
+                            sats_by_id: dict[int, dict],
+                            raan_tol_deg: float,
+                            max_iter: int = 25) -> dict[int, list[int]]:
+    """Cluster a set of satellites in one shell into planes using RAAN only.
+
+    Uses a mean-shift-style iteration on circular RAAN:
+      1. Seed centers at every distinct RAAN (rounded).
+      2. Assign each sat to nearest center.
+      3. Recompute each center as circular mean of members.
+      4. Merge centers closer than raan_tol_deg/2.
+      5. Repeat until stable or max_iter.
     """
-    indexed = sorted(
-        [(sat["id"], sat["raan"]) for sat in sats],
-        key=lambda x: x[1]
-    )
+    if len(shell_sat_ids) <= 1:
+        return {0: list(shell_sat_ids)}
 
-    planes = []
-    current = [indexed[0]]
+    raans = np.array([sats_by_id[sid]["raan_deg"] for sid in shell_sat_ids])
 
-    for item in indexed[1:]:
-        _, raan = item
-        _, prev_raan = current[-1]
-        if ang_diff_deg(raan, prev_raan) <= raan_tol_deg:
-            current.append(item)
-        else:
-            planes.append(current)
-            current = [item]
-    planes.append(current)
+    seed_step = max(raan_tol_deg / 2.0, 0.5)
+    seeds = np.arange(0.0, 360.0, seed_step)
+    centers = seeds.tolist()
 
-    # Merge first/last cluster if they are close across 0/360 wrap
-    if len(planes) > 1:
-        first_raan = planes[0][0][1]
-        last_raan = planes[-1][-1][1]
-        if ang_diff_deg(first_raan, last_raan) <= raan_tol_deg:
-            merged = planes[-1] + planes[0]
-            planes = [merged] + planes[1:-1]
+    for _ in range(max_iter):
+        assigned = defaultdict(list)
+        for raan, sid in zip(raans, shell_sat_ids):
+            best_c = min(range(len(centers)),
+                         key=lambda ci: ang_diff_deg(raan, centers[ci]))
+            assigned[best_c].append((sid, raan))
 
-    plane_map = {}
-    plane_means = []
+        new_centers: list[float] = []
+        for ci, members in assigned.items():
+            if not members:
+                continue
+            mean = circ_mean_deg([m[1] for m in members])
+            new_centers.append(mean)
 
-    for pid, plane in enumerate(planes):
-        ids = [sid for sid, _ in plane]
-        mean_raan = sum(raan for _, raan in plane) / len(plane)
-        plane_means.append((pid, mean_raan))
-        plane_map[pid] = ids
+        merged: list[float] = []
+        for c in sorted(new_centers):
+            if not merged:
+                merged.append(c)
+                continue
+            if ang_diff_deg(c, merged[-1]) <= raan_tol_deg / 2.0:
+                merged[-1] = circ_mean_deg([merged[-1], c])
+            else:
+                merged.append(c)
+        if len(merged) >= 2 and ang_diff_deg(merged[0], merged[-1]) <= raan_tol_deg / 2.0:
+            merged[0] = circ_mean_deg([merged[0], merged[-1]])
+            merged.pop()
 
-    plane_order = [pid for pid, _ in sorted(plane_means, key=lambda x: x[1])]
+        if (len(merged) == len(centers)
+                and all(ang_diff_deg(a, b) < 1e-3
+                        for a, b in zip(sorted(merged), sorted(centers)))):
+            centers = merged
+            break
+        centers = merged
 
-    return plane_map, plane_order
+    planes: dict[int, list[int]] = defaultdict(list)
+    for raan, sid in zip(raans, shell_sat_ids):
+        best_c = min(range(len(centers)),
+                     key=lambda ci: ang_diff_deg(raan, centers[ci]))
+        if ang_diff_deg(raan, centers[best_c]) > raan_tol_deg:
+            # Not close to any center -> its own plane.
+            planes[len(centers) + len(planes)].append(sid)
+            continue
+        planes[best_c].append(sid)
 
-
-def assign_plane_ids(sats, planes):
-    sat_to_plane = {}
-    for pid, ids in planes.items():
-        for sid in ids:
-            sat_to_plane[sid] = pid
-    for sat in sats:
-        sat["plane_id"] = sat_to_plane[sat["id"]]
-
-
-def sort_plane_members(sats, planes):
-    """
-    Sort satellites within each plane using a simple angular ordering in ECI.
-    This is an approximation, but good enough for a structured snapshot model.
-    """
-    sat_by_id = {sat["id"]: sat for sat in sats}
-    ordered = {}
-
-    for pid, ids in planes.items():
-        members = [sat_by_id[sid] for sid in ids]
-        members.sort(key=lambda s: math.atan2(s["y"], s["x"]))
-        ordered[pid] = [m["id"] for m in members]
-
-    return ordered
+    return {new_pid: ids for new_pid, (_old, ids) in enumerate(planes.items())}
 
 
-def try_add_edge(u, v, sats_by_id, degree, edge_pairs, edges, max_km, max_degree):
-    if u == v:
+def order_by_argument_of_latitude(plane_sat_ids: list[int],
+                                  sats_by_id: dict[int, dict]) -> list[int]:
+    """Sort satellites along-track by argument of latitude u = argp + nu."""
+    return sorted(plane_sat_ids, key=lambda sid: sats_by_id[sid]["u_deg"])
+
+
+# ---------------------------------------------------------------------------
+# ISL edge construction (addresses items 7, 8, 24)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IslPolicy:
+    max_km: float = 5000.0
+    max_degree: int = 4
+    intra_plane_neighbours: int = 2
+    allowed_plane_offsets: tuple = (-2, -1, 1, 2)
+    min_elevation_angle_deg: float = -90.0  # relative to horizon at midpoint
+    disable_above_abs_lat_deg: float = 70.0  # seam avoidance for inclined shells
+    apply_seam_avoidance: bool = True
+
+
+def link_midpoint_subpoint_lat(r1_eci: np.ndarray,
+                               r2_eci: np.ndarray,
+                               jd: float,
+                               fr: float) -> float:
+    mid = 0.5 * (r1_eci + r2_eci)
+    ecef = eci_to_ecef(mid, jd, fr)
+    lat, _, _ = ecef_to_geodetic(ecef)
+    return abs(lat)
+
+
+def try_add_edge(u_id: int,
+                 v_id: int,
+                 sats_by_id: dict[int, dict],
+                 degree: dict[int, int],
+                 edge_pairs: set,
+                 edges: list,
+                 policy: IslPolicy,
+                 jd: float,
+                 fr: float,
+                 kind: str,
+                 extra_range_km: Optional[float] = None) -> bool:
+    if u_id == v_id:
         return False
-    a, b = sorted((u, v))
+    a, b = sorted((u_id, v_id))
     if (a, b) in edge_pairs:
         return False
-    if degree[a] >= max_degree or degree[b] >= max_degree:
+    if degree[a] >= policy.max_degree or degree[b] >= policy.max_degree:
         return False
 
-    r1 = sats_by_id[a]["r"]
-    r2 = sats_by_id[b]["r"]
+    s1 = sats_by_id[a]
+    s2 = sats_by_id[b]
+    r1, r2 = s1["r_eci"], s2["r_eci"]
 
+    d = distance_km(r1, r2)
+    limit = extra_range_km if extra_range_km is not None else policy.max_km
+    if d > limit:
+        return False
     if not has_line_of_sight(r1, r2):
         return False
 
-    d = distance_km(r1, r2)
-    if d > max_km:
-        return False
+    if policy.apply_seam_avoidance:
+        mid_lat = link_midpoint_subpoint_lat(r1, r2, jd, fr)
+        if mid_lat > policy.disable_above_abs_lat_deg:
+            return False
 
     delay_ms = (d / C_KM_S) * 1000.0
     edge_pairs.add((a, b))
-    edges.append((a, b, d, delay_ms))
+    edges.append({
+        "u": a, "v": b,
+        "distance_km": d, "delay_ms": delay_ms,
+        "kind": kind,
+        "shell_id": s1.get("shell_id", -1) if s1.get("shell_id") == s2.get("shell_id") else -1,
+    })
     degree[a] += 1
     degree[b] += 1
     return True
 
 
-def ring_neighbors(ordered_ids, sid, count):
+def ring_neighbors(ordered_ids: list[int], sid: int, count: int) -> list[int]:
     n = len(ordered_ids)
     if n < 2 or count <= 0:
         return []
-
     idx = ordered_ids.index(sid)
-    candidates = []
-
-    offsets = []
+    out = []
     step = 1
-    while len(offsets) < count:
-        offsets.append(-step)
-        if len(offsets) < count:
-            offsets.append(step)
+    while len(out) < count and step <= n // 2 + 1:
+        for off in (-step, step):
+            nbr = ordered_ids[(idx + off) % n]
+            if nbr != sid and nbr not in out:
+                out.append(nbr)
+                if len(out) >= count:
+                    break
         step += 1
-
-    for off in offsets:
-        nbr = ordered_ids[(idx + off) % n]
-        if nbr != sid and nbr not in candidates:
-            candidates.append(nbr)
-
-    return candidates[:count]
+    return out[:count]
 
 
-def main():
-    ap = argparse.ArgumentParser()
+# ---------------------------------------------------------------------------
+# Ground gateways (review items 25, 26)
+# ---------------------------------------------------------------------------
+
+# A small built-in set of representative public gateway locations. This is
+# NOT an official Starlink gateway list — it is a reasonable default so the
+# scenario is not sat-only. Override with --gateways_csv for real studies.
+DEFAULT_GATEWAYS = [
+    ("LON",   51.5074,   -0.1278, 0.03),
+    ("NYC",   40.7128,  -74.0060, 0.02),
+    ("LAX",   33.9416, -118.4085, 0.04),
+    ("SEA",   47.4502, -122.3088, 0.06),
+    ("FRA",   50.1109,    8.6821, 0.11),
+    ("SIN",    1.3521,  103.8198, 0.02),
+    ("SYD",  -33.8688,  151.2093, 0.06),
+    ("TYO",   35.6762,  139.6503, 0.04),
+    ("GRU",  -23.5505,  -46.6333, 0.76),
+    ("JNB",  -26.2041,   28.0473, 1.75),
+]
+
+
+def read_gateway_csv(path: str) -> list[tuple[str, float, float, float]]:
+    df = pd.read_csv(path)
+    cols = {c.lower(): c for c in df.columns}
+    name_col = cols.get("name") or cols.get("id") or df.columns[0]
+    out = []
+    for _, row in df.iterrows():
+        name = str(row[name_col])
+        lat = float(row[cols["lat"]])
+        lon = float(row[cols["lon"]])
+        alt = float(row[cols["alt_km"]]) if "alt_km" in cols else 0.0
+        out.append((name, lat, lon, alt))
+    return out
+
+
+def build_access_links(ground_stations: list[dict],
+                       sats: list[dict],
+                       sats_by_id: dict[int, dict],
+                       degree: dict[int, int],
+                       edge_pairs: set,
+                       edges: list,
+                       policy: IslPolicy,
+                       min_elevation_deg: float,
+                       max_range_km: float,
+                       max_sats_per_gs: int,
+                       max_gs_per_sat: int,
+                       jd: float,
+                       fr: float) -> list[tuple[int, int]]:
+    """Add ground-to-satellite access links. Elevation check uses ECEF.
+
+    Access links use their own per-satellite degree budget (max_gs_per_sat)
+    rather than the shared ISL degree cap so that ISL construction order does
+    not crowd out gateway connectivity.
+    """
+    sat_access_degree: dict[int, int] = defaultdict(int)
+    added_pairs = []
+    for gs in ground_stations:
+        candidates = []
+        gs_ecef = gs["r_ecef"]
+        gs_up = gs_ecef / max(np.linalg.norm(gs_ecef), 1e-9)
+        for s in sats:
+            sat_ecef = s["r_ecef"]
+            los = sat_ecef - gs_ecef
+            dist = float(np.linalg.norm(los))
+            if dist > max_range_km or dist <= 0:
+                continue
+            elev = math.degrees(math.asin(max(-1.0, min(1.0,
+                float(np.dot(los, gs_up) / dist)))))
+            if elev < min_elevation_deg:
+                continue
+            candidates.append((dist, elev, s["id"]))
+
+        candidates.sort(key=lambda x: x[0])
+        for dist, elev, sid in candidates[:max_sats_per_gs]:
+            gs_id = gs["id"]
+            if degree[gs_id] >= max_sats_per_gs:
+                break
+            if sat_access_degree[sid] >= max_gs_per_sat:
+                continue
+            pair = tuple(sorted((gs_id, sid)))
+            if pair in edge_pairs:
+                continue
+            delay_ms = (dist / C_KM_S) * 1000.0
+            edge_pairs.add(pair)
+            edges.append({
+                "u": pair[0], "v": pair[1],
+                "distance_km": dist, "delay_ms": delay_ms,
+                "kind": "access",
+                "shell_id": -1,
+            })
+            degree[gs_id] += 1
+            degree[sid] += 1
+            sat_access_degree[sid] += 1
+            added_pairs.append(pair)
+    return added_pairs
+
+
+# ---------------------------------------------------------------------------
+# Validation (review item 29)
+# ---------------------------------------------------------------------------
+
+def connected_components(num_nodes: int, edges: list[dict]) -> list[set]:
+    adj = defaultdict(list)
+    for e in edges:
+        adj[e["u"]].append(e["v"])
+        adj[e["v"]].append(e["u"])
+    visited = set()
+    comps = []
+    for start in range(num_nodes):
+        if start in visited:
+            continue
+        stack = [start]
+        comp = set()
+        while stack:
+            x = stack.pop()
+            if x in visited:
+                continue
+            visited.add(x)
+            comp.add(x)
+            stack.extend(adj[x])
+        comps.append(comp)
+    comps.sort(key=len, reverse=True)
+    return comps
+
+
+def validate_topology(sats: list[dict],
+                      ground_stations: list[dict],
+                      edges: list[dict],
+                      degree: dict[int, int],
+                      shells: dict[int, list[int]],
+                      planes_per_shell: dict[int, dict[int, list[int]]],
+                      args,
+                      strict: bool) -> dict:
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    num_nodes = len(sats) + len(ground_stations)
+    isl_distances = [e["distance_km"] for e in edges if e["kind"] != "access"]
+    access_distances = [e["distance_km"] for e in edges if e["kind"] == "access"]
+
+    comps = connected_components(num_nodes, edges)
+    largest = len(comps[0]) if comps else 0
+    sat_ids = {s["id"] for s in sats}
+    isolated_sats = sum(1 for sid in sat_ids if degree.get(sid, 0) == 0)
+    isolated_gws  = sum(1 for gs in ground_stations if degree.get(gs["id"], 0) == 0)
+    isolated = isolated_sats + isolated_gws
+
+    if sats and num_nodes > 0 and largest / num_nodes < args.min_largest_cc_frac:
+        msg = (f"Largest CC covers only {largest}/{num_nodes} nodes "
+               f"(< {args.min_largest_cc_frac*100:.0f}%).")
+        (issues if strict else warnings).append(msg)
+
+    if sats and isolated_sats / len(sats) > args.max_isolated_frac:
+        msg = (f"{isolated_sats}/{len(sats)} satellites have no links "
+               f"(gateways isolated: {isolated_gws}).")
+        (issues if strict else warnings).append(msg)
+
+    if isl_distances:
+        mean_isl = float(np.mean(isl_distances))
+        max_isl = float(np.max(isl_distances))
+        if max_isl > args.max_km:
+            issues.append(f"ISL length {max_isl:.1f} km exceeds --max_km {args.max_km:.1f}.")
+        if mean_isl < 50.0:
+            warnings.append(
+                f"Mean ISL length {mean_isl:.1f} km is implausibly short.")
+
+    for shell_id, plane_map in planes_per_shell.items():
+        pcount = len(plane_map)
+        if pcount == 0:
+            continue
+        sizes = [len(m) for m in plane_map.values()]
+        if pcount > 2 * args.n:
+            warnings.append(
+                f"Shell {shell_id}: {pcount} planes inferred for "
+                f"{sum(sizes)} sats — possibly over-clustered.")
+        if max(sizes) > 0 and max(sizes) / min(sizes) > 20 and min(sizes) < 2:
+            warnings.append(
+                f"Shell {shell_id}: very uneven planes (min={min(sizes)}, "
+                f"max={max(sizes)}).")
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "warnings": warnings,
+        "num_nodes": num_nodes,
+        "num_satellites": len(sats),
+        "num_gateways": len(ground_stations),
+        "num_edges": len(edges),
+        "num_isl": len(isl_distances),
+        "num_access": len(access_distances),
+        "num_shells": len(shells),
+        "num_components": len(comps),
+        "largest_component_size": largest,
+        "isolated_nodes": isolated,
+        "mean_isl_km": float(np.mean(isl_distances)) if isl_distances else 0.0,
+        "max_isl_km": float(np.max(isl_distances)) if isl_distances else 0.0,
+        "min_isl_km": float(np.min(isl_distances)) if isl_distances else 0.0,
+        "mean_access_km": float(np.mean(access_distances)) if access_distances else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Build a physically consistent snapshot from TLEs.")
     ap.add_argument("--tle", required=True)
     ap.add_argument("--edges_out", default="results/snapshot_edges.csv")
     ap.add_argument("--nodes_out", default="results/snapshot_nodes.csv")
-    ap.add_argument("--n", type=int, default=60)
-    ap.add_argument("--max_km", type=float, default=5000.0)
-    ap.add_argument(
-        "--utc",
-        default=None,
-        help="UTC timestamp (ISO-8601) to propagate all satellites to. "
-             "If omitted, each satellite is evaluated at its own TLE epoch.",
-    )
-    ap.add_argument("--jd", type=float, default=None,
-                    help="Override Julian day (advanced). Used together with --fr.")
-    ap.add_argument("--fr", type=float, default=0.0,
-                    help="Fractional day offset for --jd (advanced).")
+    ap.add_argument("--stats_out", default="results/topology_stats.csv")
+    ap.add_argument("--meta_out", default="results/snapshot_meta.json")
 
+    ap.add_argument("--n", type=int, default=60,
+                    help="Number of TLEs to sample (after filtering).")
+    ap.add_argument("--sample", choices=["head", "random"], default="head")
+    ap.add_argument("--seed", type=int, default=None)
+
+    ap.add_argument("--utc", default=None,
+                    help="Common propagation epoch as ISO-8601 UTC. "
+                         "If omitted, the median TLE epoch is used.")
+    ap.add_argument("--jd", type=float, default=None)
+    ap.add_argument("--fr", type=float, default=0.0)
+    ap.add_argument("--allow_tle_epoch", action="store_true",
+                    help="Allow per-satellite-epoch mode. Physically "
+                         "inconsistent; not recommended.")
+
+    ap.add_argument("--max_km", type=float, default=5000.0)
     ap.add_argument("--max_degree", type=int, default=4)
     ap.add_argument("--intra_plane", type=int, default=2)
     ap.add_argument("--inter_plane", type=int, default=2)
     ap.add_argument("--raan_tol_deg", type=float, default=5.0)
-    ap.add_argument("--seed", type=int, default=None,
-                    help="Optional seed for deterministic TLE sampling.")
-    ap.add_argument("--sample", choices=["head", "random"], default="head",
-                    help="How to select --n TLEs from the dataset.")
-    ap.add_argument("--stats_out", default="results/topology_stats.csv",
-                    help="CSV file to write topology summary statistics into.")
+    ap.add_argument("--inc_tol_deg", type=float, default=1.0)
+    ap.add_argument("--alt_tol_km", type=float, default=25.0)
+    ap.add_argument("--disable_isl_above_abs_lat_deg", type=float, default=70.0,
+                    help="Seam avoidance: reject ISLs whose subpoint is above "
+                         "this absolute latitude (matches how inclined "
+                         "Starlink shells cannot cross polar seams cleanly).")
+    ap.add_argument("--no_seam_avoidance", action="store_true")
 
-    args = ap.parse_args()
+    ap.add_argument("--gateways_csv", default=None,
+                    help="CSV with name,lat,lon[,alt_km]. Built-in set used "
+                         "if omitted. Pass '' to disable gateways.")
+    ap.add_argument("--no_gateways", action="store_true")
+    ap.add_argument("--gs_min_elevation_deg", type=float, default=25.0)
+    ap.add_argument("--gs_max_range_km", type=float, default=2000.0)
+    ap.add_argument("--gs_max_sats", type=int, default=4,
+                    help="Max satellites per gateway (gateway degree cap).")
+    ap.add_argument("--gs_max_per_sat", type=int, default=2,
+                    help="Max gateways that may connect to one satellite "
+                         "(separate from the ISL degree cap).")
 
-    # Resolve propagation epoch policy.
-    common_jd = None
-    common_fr = None
-    epoch_mode = "tle"
+    ap.add_argument("--multi_epoch_seconds", type=float, default=None,
+                    help="If set, also emit snapshots at this cadence for "
+                         "--epoch_steps steps, into per-step files.")
+    ap.add_argument("--epoch_steps", type=int, default=1)
+
+    ap.add_argument("--min_largest_cc_frac", type=float, default=0.5)
+    ap.add_argument("--max_isolated_frac", type=float, default=0.25)
+    ap.add_argument("--strict", action="store_true",
+                    help="Fail (exit non-zero) when validation finds issues.")
+
+    return ap.parse_args()
+
+
+def resolve_common_epoch(args, satrecs) -> tuple[float, float, str]:
     if args.jd is not None:
-        common_jd = float(args.jd)
-        common_fr = float(args.fr)
-        epoch_mode = f"jd={common_jd}+{common_fr}"
-    elif args.utc is not None:
-        common_jd, common_fr = utc_to_jd(args.utc)
-        epoch_mode = f"utc={args.utc}"
+        return float(args.jd), float(args.fr), f"jd={args.jd}+{args.fr}"
+    if args.utc is not None:
+        jd, fr = utc_to_jd(args.utc)
+        return jd, fr, f"utc={args.utc}"
+    if args.allow_tle_epoch:
+        # Do not return jd=0/fr=0 — we still need a valid reference epoch for
+        # ECI→ECEF conversions and gateway placement. Use the median TLE epoch
+        # as a reference; propagate_one will override per-satellite when
+        # per_tle_mode=True.
+        epochs = [tle_epoch_jd(s) for s in satrecs]
+        med = float(np.median(epochs))
+        jd = math.floor(med) - 0.5
+        fr = med - jd
+        if fr >= 1.0:
+            jd += 1.0
+            fr -= 1.0
+        return jd, fr, "per-tle-epoch"
+    # default: median TLE epoch of the sampled population
+    epochs = [tle_epoch_jd(s) for s in satrecs]
+    med = float(np.median(epochs))
+    jd = math.floor(med) - 0.5
+    fr = med - jd
+    if fr >= 1.0:
+        jd += 1.0
+        fr -= 1.0
+    return jd, fr, f"median-tle-epoch={jd_to_iso(jd, fr)}"
+
+
+def propagate_one(satrec: Satrec, jd: float, fr: float,
+                  per_tle: bool) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    if per_tle:
+        jd_eval, fr_eval = satrec.jdsatepoch, satrec.jdsatepochF
+    else:
+        jd_eval, fr_eval = jd, fr
+    e, r, v = satrec.sgp4(jd_eval, fr_eval)
+    if e != 0:
+        return None
+    return np.array(r, dtype=float), np.array(v, dtype=float)
+
+
+def build_snapshot(args,
+                   raw_sats: list[tuple[str, str, str]],
+                   satrecs: list[Satrec],
+                   jd: float,
+                   fr: float,
+                   epoch_mode: str,
+                   gateways: list[tuple[str, float, float, float]]):
+    per_tle_mode = epoch_mode == "per-tle-epoch"
+
+    sats: list[dict] = []
+    rejected_sgp4 = 0
+    rejected_altitude = 0
+
+    for i, ((name, l1, l2), sr) in enumerate(zip(raw_sats, satrecs)):
+        result = propagate_one(sr, jd, fr, per_tle_mode)
+        if result is None:
+            rejected_sgp4 += 1
+            continue
+        r_eci, v_eci = result
+        radius = float(np.linalg.norm(r_eci))
+        if not (MIN_RADIUS_KM <= radius <= MAX_RADIUS_KM):
+            rejected_altitude += 1
+            continue
+
+        elements = classical_elements(r_eci, v_eci)
+        # Perigee-altitude proxy used only for shell clustering (not exported).
+        _perigee_alt_km = elements["a_km"] * (1 - elements["e"]) - EARTH_RADIUS_KM
+        # For per-TLE mode use the satellite's own epoch for ECEF rotation so
+        # we don't rotate with jd=reference which would be wrong per-satellite.
+        if per_tle_mode:
+            jd_ecef, fr_ecef = float(sr.jdsatepoch), float(sr.jdsatepochF)
+        else:
+            jd_ecef, fr_ecef = jd, fr
+        r_ecef = eci_to_ecef(r_eci, jd_ecef, fr_ecef)
+        lat, lon, geo_alt = ecef_to_geodetic(r_ecef)
+
+        sats.append({
+            "id": len(sats),
+            "name": name,
+            "l1": l1, "l2": l2,
+            "r_eci": r_eci,
+            "v_eci": v_eci,
+            "r_ecef": r_ecef,
+            "a_km": elements["a_km"],
+            "e": elements["e"],
+            "i_deg": elements["i_deg"],
+            "raan_deg": elements["raan_deg"],
+            "argp_deg": elements["argp_deg"],
+            "nu_deg": elements["nu_deg"],
+            "u_deg": elements["u_deg"],
+            "alt_km": _perigee_alt_km,   # shell clustering proxy (not written to CSV)
+            "lat_deg": lat,
+            "lon_deg": lon,
+            "geo_alt_km": geo_alt,       # true geodetic altitude — written as altitude_km
+            "shell_id": -1,
+            "plane_id": -1,
+        })
+
+    if len(sats) < 2:
+        raise SystemExit("Not enough valid satellites after filtering.")
+
+    sats_by_id = {s["id"]: s for s in sats}
+
+    shells = cluster_shells(sats, args.inc_tol_deg, args.alt_tol_km)
+    planes_per_shell: dict[int, dict[int, list[int]]] = {}
+    plane_counter = 0
+    plane_to_shell: dict[int, int] = {}
+    for shell_id, ids in shells.items():
+        for sid in ids:
+            sats_by_id[sid]["shell_id"] = shell_id
+        planes_in_shell = cluster_planes_in_shell(
+            ids, sats_by_id, args.raan_tol_deg)
+        renumbered: dict[int, list[int]] = {}
+        for _, plane_ids in planes_in_shell.items():
+            new_pid = plane_counter
+            plane_counter += 1
+            renumbered[new_pid] = plane_ids
+            plane_to_shell[new_pid] = shell_id
+            for sid in plane_ids:
+                sats_by_id[sid]["plane_id"] = new_pid
+        planes_per_shell[shell_id] = renumbered
+
+    ordered_planes: dict[int, list[int]] = {}
+    for shell_id, plane_map in planes_per_shell.items():
+        for pid, ids in plane_map.items():
+            ordered_planes[pid] = order_by_argument_of_latitude(ids, sats_by_id)
+
+    policy = IslPolicy(
+        max_km=args.max_km,
+        max_degree=args.max_degree,
+        intra_plane_neighbours=args.intra_plane,
+        allowed_plane_offsets=tuple(
+            o for o in range(-args.inter_plane, args.inter_plane + 1) if o != 0),
+        disable_above_abs_lat_deg=args.disable_isl_above_abs_lat_deg,
+        apply_seam_avoidance=not args.no_seam_avoidance,
+    )
+
+    ground_stations: list[dict] = []
+    if gateways and not args.no_gateways:
+        for idx, (gname, lat, lon, alt_km) in enumerate(gateways):
+            gs_id = len(sats) + idx
+            r_ecef = geodetic_to_ecef(lat, lon, alt_km)
+            r_eci = ecef_to_eci(r_ecef, jd, fr)
+            ground_stations.append({
+                "id": gs_id,
+                "name": f"GW-{gname}",
+                "kind": "gateway",
+                "lat_deg": lat, "lon_deg": lon, "alt_km": alt_km,
+                "r_eci": r_eci, "r_ecef": r_ecef,
+                "shell_id": -1, "plane_id": -1,
+            })
+
+    all_nodes = len(sats) + len(ground_stations)
+    degree = {nid: 0 for nid in range(all_nodes)}
+    edge_pairs: set[tuple[int, int]] = set()
+    edges: list[dict] = []
+
+    # Intra-plane ring links
+    for pid, ordered_ids in ordered_planes.items():
+        for sid in ordered_ids:
+            for nid in ring_neighbors(ordered_ids, sid, args.intra_plane):
+                try_add_edge(sid, nid, sats_by_id, degree, edge_pairs, edges,
+                             policy, jd, fr, kind="intra_plane")
+
+    # Inter-plane links: same shell, allowed plane offsets only
+    for shell_id, plane_map in planes_per_shell.items():
+        pids = list(plane_map.keys())
+        plane_of_sid = {sid: pid for pid, ids in plane_map.items() for sid in ids}
+        if len(pids) < 2:
+            continue
+        # order planes by mean RAAN within shell (circular)
+        mean_raan = {pid: circ_mean_deg([sats_by_id[s]["raan_deg"] for s in ids])
+                     for pid, ids in plane_map.items()}
+        order_in_shell = sorted(pids, key=lambda p: mean_raan[p])
+        pos = {pid: i for i, pid in enumerate(order_in_shell)}
+        n_planes = len(order_in_shell)
+
+        for sid, shell_plane_id in plane_of_sid.items():
+            p_here = pos[shell_plane_id]
+            offsets = [o for o in policy.allowed_plane_offsets
+                       if abs(o) <= min(args.inter_plane, n_planes // 2)]
+            adj_pids = {order_in_shell[(p_here + o) % n_planes] for o in offsets}
+
+            candidates: list[tuple[float, int]] = []
+            for adj_pid in adj_pids:
+                for nid in plane_map[adj_pid]:
+                    if nid == sid:
+                        continue
+                    if degree[nid] >= policy.max_degree:
+                        continue
+                    r1, r2 = sats_by_id[sid]["r_eci"], sats_by_id[nid]["r_eci"]
+                    d = distance_km(r1, r2)
+                    if d <= policy.max_km and has_line_of_sight(r1, r2):
+                        candidates.append((d, nid))
+
+            candidates.sort(key=lambda x: x[0])
+            chosen = 0
+            for _, nid in candidates:
+                if chosen >= args.inter_plane:
+                    break
+                if degree[sid] >= policy.max_degree:
+                    break
+                if try_add_edge(sid, nid, sats_by_id, degree, edge_pairs, edges,
+                                policy, jd, fr, kind="inter_plane"):
+                    chosen += 1
+
+    # Ground access links
+    if ground_stations:
+        build_access_links(
+            ground_stations, sats, sats_by_id, degree,
+            edge_pairs, edges, policy,
+            args.gs_min_elevation_deg, args.gs_max_range_km,
+            args.gs_max_sats, args.gs_max_per_sat, jd, fr,
+        )
+
+    edges.sort(key=lambda e: (e["u"], e["v"]))
+
+    node_rows = [{
+        "id": s["id"], "name": s["name"], "kind": "satellite",
+        "shell_id": s["shell_id"], "plane_id": s["plane_id"],
+        "inclination_deg": round(s["i_deg"], 4),
+        "raan_deg": round(s["raan_deg"], 4),
+        "argp_deg": round(s["argp_deg"], 4),
+        "true_anomaly_deg": round(s["nu_deg"], 4),
+        "arg_of_lat_deg": round(s["u_deg"], 4),
+        "semi_major_axis_km": round(s["a_km"], 4),
+        "altitude_km": round(s["geo_alt_km"], 4),
+        "eci_x_km": s["r_eci"][0], "eci_y_km": s["r_eci"][1], "eci_z_km": s["r_eci"][2],
+        "ecef_x_km": s["r_ecef"][0], "ecef_y_km": s["r_ecef"][1], "ecef_z_km": s["r_ecef"][2],
+        "lat_deg": round(s["lat_deg"], 4),
+        "lon_deg": round(s["lon_deg"], 4),
+        "degree": degree[s["id"]],
+    } for s in sats]
+
+    for gs in ground_stations:
+        node_rows.append({
+            "id": gs["id"], "name": gs["name"], "kind": "gateway",
+            "shell_id": -1, "plane_id": -1,
+            "inclination_deg": 0.0, "raan_deg": 0.0,
+            "argp_deg": 0.0, "true_anomaly_deg": 0.0, "arg_of_lat_deg": 0.0,
+            "semi_major_axis_km": 0.0, "altitude_km": gs["alt_km"],
+            "eci_x_km": gs["r_eci"][0], "eci_y_km": gs["r_eci"][1], "eci_z_km": gs["r_eci"][2],
+            "ecef_x_km": gs["r_ecef"][0], "ecef_y_km": gs["r_ecef"][1], "ecef_z_km": gs["r_ecef"][2],
+            "lat_deg": round(gs["lat_deg"], 4),
+            "lon_deg": round(gs["lon_deg"], 4),
+            "degree": degree[gs["id"]],
+        })
+
+    edge_rows = [{
+        "u": e["u"], "v": e["v"],
+        "distance_km": e["distance_km"],
+        "delay_ms": e["delay_ms"],
+        "kind": e["kind"],
+        "shell_id": e["shell_id"],
+    } for e in edges]
+
+    return sats, ground_stations, edges, degree, shells, planes_per_shell, node_rows, edge_rows
+
+
+def atomic_write_csv(df: pd.DataFrame, path: str) -> None:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def atomic_write_json(obj, path: str) -> None:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def main():
+    args = parse_args()
 
     all_tles = read_tles(args.tle)
+    if not all_tles:
+        raise SystemExit(f"No TLEs found in {args.tle}")
+
     if args.sample == "random":
         rng = np.random.default_rng(args.seed)
-        idx = rng.choice(len(all_tles), size=min(args.n, len(all_tles)), replace=False)
+        idx = rng.choice(len(all_tles), size=min(args.n, len(all_tles)),
+                         replace=False)
         raw_sats = [all_tles[i] for i in sorted(idx.tolist())]
     else:
         raw_sats = all_tles[:args.n]
 
     satrecs = [Satrec.twoline2rv(l1, l2) for _, l1, l2 in raw_sats]
 
-    sats = []
-    rejected_sgp4 = 0
-    rejected_altitude = 0
-    for i, ((name, l1, l2), s) in enumerate(zip(raw_sats, satrecs)):
-        if common_jd is None:
-            jd_eval = s.jdsatepoch
-            fr_eval = s.jdsatepochF
+    jd, fr, epoch_mode = resolve_common_epoch(args, satrecs)
+    if epoch_mode == "per-tle-epoch":
+        print("WARNING: per-TLE-epoch mode is physically inconsistent. "
+              "Distances, LOS and delays compare satellites at different "
+              "time instants.", file=sys.stderr)
+
+    # Gateway set
+    gateways: list[tuple[str, float, float, float]] = []
+    if args.no_gateways:
+        gateways = []
+    elif args.gateways_csv:
+        if args.gateways_csv.strip():
+            gateways = read_gateway_csv(args.gateways_csv)
+    else:
+        gateways = list(DEFAULT_GATEWAYS)
+
+    epoch_steps = max(1, args.epoch_steps)
+    step_dt_s = args.multi_epoch_seconds or 0.0
+
+    base_edges_out = args.edges_out
+    base_nodes_out = args.nodes_out
+    all_validations = []
+
+    for step in range(epoch_steps):
+        if step == 0:
+            jd_eval, fr_eval = jd, fr
+            edges_out = base_edges_out
+            nodes_out = base_nodes_out
         else:
-            jd_eval = common_jd
-            fr_eval = common_fr
+            total_frac = fr + (step * step_dt_s) / 86400.0
+            extra_days = math.floor(total_frac)
+            jd_eval = jd + extra_days
+            fr_eval = total_frac - extra_days
+            stem_edges, ext_edges = os.path.splitext(base_edges_out)
+            stem_nodes, ext_nodes = os.path.splitext(base_nodes_out)
+            edges_out = f"{stem_edges}.t{step}{ext_edges}"
+            nodes_out = f"{stem_nodes}.t{step}{ext_nodes}"
 
-        e, r, _ = s.sgp4(jd_eval, fr_eval)
-        if e != 0:
-            rejected_sgp4 += 1
-            continue
+        (sats, ground_stations, edges, degree,
+         shells, planes_per_shell,
+         node_rows, edge_rows) = build_snapshot(
+            args, raw_sats, satrecs, jd_eval, fr_eval,
+            epoch_mode, gateways)
 
-        radius = float(np.linalg.norm(r))
-        if not (MIN_RADIUS_KM <= radius <= MAX_RADIUS_KM):
-            rejected_altitude += 1
-            continue
+        atomic_write_csv(pd.DataFrame(edge_rows), edges_out)
+        atomic_write_csv(pd.DataFrame(node_rows), nodes_out)
 
-        try:
-            raan = tle_raan_deg(l2)
-        except Exception:
-            continue
-
-        sats.append({
-            "id": len(sats),
-            "orig_index": i,
-            "name": name,
-            "l1": l1,
-            "l2": l2,
-            "r": np.array(r, dtype=float),
-            "x": float(r[0]),
-            "y": float(r[1]),
-            "z": float(r[2]),
-            "raan": raan,
+        validation = validate_topology(
+            sats, ground_stations, edges, degree,
+            shells, planes_per_shell, args, strict=args.strict)
+        all_validations.append({
+            "step": step,
+            "jd": jd_eval, "fr": fr_eval,
+            "iso": jd_to_iso(jd_eval, fr_eval),
+            **validation,
         })
 
-    N = len(sats)
-    if N < 2:
-        raise SystemExit("Not enough valid satellites.")
+        print(f"[step {step}] epoch={jd_to_iso(jd_eval, fr_eval)} "
+              f"sats={len(sats)} gws={len(ground_stations)} "
+              f"shells={len(shells)} edges={len(edges)} "
+              f"largest_cc={validation['largest_component_size']} / "
+              f"{validation['num_nodes']}")
+        for w in validation["warnings"]:
+            print(f"  WARNING: {w}", file=sys.stderr)
+        for iss in validation["issues"]:
+            print(f"  ERROR: {iss}", file=sys.stderr)
 
-    sats_by_id = {sat["id"]: sat for sat in sats}
+    # Stats
+    stats_rows = []
+    for v in all_validations:
+        stats_rows.append({
+            "step": v["step"],
+            "epoch_utc": v["iso"],
+            "num_nodes": v["num_nodes"],
+            "num_satellites": v["num_satellites"],
+            "num_gateways": v["num_gateways"],
+            "num_edges": v["num_edges"],
+            "num_isl": v["num_isl"],
+            "num_access": v["num_access"],
+            "num_shells": v["num_shells"],
+            "num_components": v["num_components"],
+            "largest_cc_size": v["largest_component_size"],
+            "isolated_nodes": v["isolated_nodes"],
+            "mean_isl_km": round(v["mean_isl_km"], 2),
+            "max_isl_km": round(v["max_isl_km"], 2),
+            "min_isl_km": round(v["min_isl_km"], 2),
+            "mean_access_km": round(v["mean_access_km"], 2),
+        })
+    atomic_write_csv(pd.DataFrame(stats_rows), args.stats_out)
 
-    planes, plane_order = cluster_planes(sats, args.raan_tol_deg)
-    assign_plane_ids(sats, planes)
-    ordered_planes = sort_plane_members(sats, planes)
+    meta = {
+        "schema_version": SCHEMA_VERSION,
+        "generator": "tle_to_snapshot.py",
+        "epoch_policy": epoch_mode,
+        "base_epoch_jd": jd,
+        "base_epoch_fr": fr,
+        "base_epoch_utc": jd_to_iso(jd, fr),
+        "multi_epoch_seconds": step_dt_s,
+        "epoch_steps": epoch_steps,
+        "delay_model": "propagation_only",
+        "serialization_model": "in_ns3",
+        "queueing_model": "in_ns3",
+        "isl_policy": {
+            "max_km": args.max_km,
+            "max_degree": args.max_degree,
+            "intra_plane_neighbours": args.intra_plane,
+            "inter_plane_offsets_max": args.inter_plane,
+            "seam_avoidance_lat_deg": args.disable_isl_above_abs_lat_deg,
+            "seam_avoidance_enabled": not args.no_seam_avoidance,
+            "raan_tol_deg": args.raan_tol_deg,
+            "inc_tol_deg": args.inc_tol_deg,
+            "alt_tol_km": args.alt_tol_km,
+        },
+        "gateway_policy": {
+            "enabled": bool(gateways) and not args.no_gateways,
+            "min_elevation_deg": args.gs_min_elevation_deg,
+            "max_range_km": args.gs_max_range_km,
+            "max_sats_per_gs": args.gs_max_sats,
+            "max_gs_per_sat": args.gs_max_per_sat,
+            "source": ("csv" if args.gateways_csv else
+                       "disabled" if args.no_gateways else "builtin"),
+            "count": len([g for g in gateways]) if not args.no_gateways else 0,
+        },
+        "sampling": {
+            "mode": args.sample, "n": args.n, "seed": args.seed,
+            "tle_file": os.path.abspath(args.tle),
+        },
+        "cli": {k: getattr(args, k) for k in vars(args)},
+        "validation_per_step": all_validations,
+    }
+    atomic_write_json(meta, args.meta_out)
 
-    degree = {sat["id"]: 0 for sat in sats}
-    edge_pairs = set()
-    edges = []
-
-    # Intra-plane links
-    for pid, ordered_ids in ordered_planes.items():
-        for sid in ordered_ids:
-            nbrs = ring_neighbors(ordered_ids, sid, args.intra_plane)
-            for nid in nbrs:
-                try_add_edge(
-                    sid, nid,
-                    sats_by_id, degree, edge_pairs, edges,
-                    args.max_km, args.max_degree
-                )
-
-    # Inter-plane links: only adjacent planes in RAAN order
-    plane_pos = {pid: i for i, pid in enumerate(plane_order)}
-
-    for sat in sats:
-        sid = sat["id"]
-        pid = sat["plane_id"]
-        pos = plane_pos[pid]
-        num_planes = len(plane_order)
-
-        if num_planes < 2 or args.inter_plane <= 0:
-            continue
-
-        adjacent_pids = set()
-        adjacent_pids.add(plane_order[(pos - 1) % num_planes])
-        adjacent_pids.add(plane_order[(pos + 1) % num_planes])
-
-        candidates = []
-        for adj_pid in adjacent_pids:
-            for nid in ordered_planes[adj_pid]:
-                if nid == sid:
-                    continue
-                if degree[sid] >= args.max_degree:
-                    break
-                if degree[nid] >= args.max_degree:
-                    continue
-
-                r1 = sats_by_id[sid]["r"]
-                r2 = sats_by_id[nid]["r"]
-                if not has_line_of_sight(r1, r2):
-                    continue
-
-                d = distance_km(r1, r2)
-                if d <= args.max_km:
-                    candidates.append((d, nid))
-
-        candidates.sort(key=lambda x: x[0])
-
-        chosen = 0
-        for _, nid in candidates:
-            added = try_add_edge(
-                sid, nid,
-                sats_by_id, degree, edge_pairs, edges,
-                args.max_km, args.max_degree
-            )
-            if added:
-                chosen += 1
-            if chosen >= args.inter_plane:
-                break
-
-    edges.sort(key=lambda x: (x[0], x[1]))
-
-    edge_rows = [{
-        "u": a,
-        "v": b,
-        "distance_km": d,
-        "delay_ms": delay_ms
-    } for a, b, d, delay_ms in edges]
-
-    node_rows = [{
-        "id": sat["id"],
-        "name": sat["name"],
-        "plane_id": sat["plane_id"],
-        "raan_deg": sat["raan"],
-        "x_km": sat["x"],
-        "y_km": sat["y"],
-        "z_km": sat["z"],
-        "degree": degree[sat["id"]],
-    } for sat in sats]
-
-    pd.DataFrame(edge_rows).to_csv(args.edges_out, index=False)
-    pd.DataFrame(node_rows).to_csv(args.nodes_out, index=False)
-
-    # Connectivity stats (approximate, via BFS over undirected graph).
-    adj = defaultdict(list)
-    for a, b, _, _ in edges:
-        adj[a].append(b)
-        adj[b].append(a)
-
-    visited = set()
-    largest = 0
-    for sid in (sat["id"] for sat in sats):
-        if sid in visited:
-            continue
-        stack = [sid]
-        size = 0
-        while stack:
-            x = stack.pop()
-            if x in visited:
-                continue
-            visited.add(x)
-            size += 1
-            stack.extend(adj[x])
-        if size > largest:
-            largest = size
-
-    isolated = sum(1 for sat in sats if degree[sat["id"]] == 0)
-
-    print(f"Epoch mode: {epoch_mode}")
-    print(f"Requested TLEs: {len(raw_sats)}")
-    print(f"Rejected (SGP4 error): {rejected_sgp4}")
-    print(f"Rejected (altitude out of LEO band): {rejected_altitude}")
-    print(f"Valid satellites: {N}")
-    print(f"Planes: {len(planes)}")
-    print(f"Edges: {len(edge_rows)}")
-    print(f"Isolated nodes: {isolated}")
-    print(f"Largest connected component: {largest} / {N}")
-    mean_isl_km = sum(d for _, _, d, _ in edges) / len(edges) if edges else 0.0
-    max_isl_km = max((d for _, _, d, _ in edges), default=0.0)
-    mean_deg = sum(degree.values()) / N if N > 0 else 0.0
-    max_deg = max(degree.values()) if degree else 0
-
-    pd.DataFrame([{
-        "num_nodes": N,
-        "num_edges": len(edge_rows),
-        "num_planes": len(planes),
-        "isolated_nodes": isolated,
-        "largest_cc_size": largest,
-        "mean_degree": round(mean_deg, 3),
-        "max_degree": max_deg,
-        "mean_isl_distance_km": round(mean_isl_km, 1),
-        "max_isl_distance_km": round(max_isl_km, 1),
-    }]).to_csv(args.stats_out, index=False)
-
-    print(f"Wrote {args.edges_out}")
-    print(f"Wrote {args.nodes_out}")
-    print(f"Wrote {args.stats_out}")
-
-    # Warnings. Written to stderr so they stand out but do not break pipelines.
-    if rejected_altitude > 0:
-        print(
-            f"WARNING: {rejected_altitude} satellite(s) rejected for unrealistic "
-            f"altitude. Consider using --utc near the TLE epoch, or refreshing "
-            f"the TLE dataset.",
-            file=sys.stderr,
-        )
-    if N > 0 and isolated / N > 0.25:
-        print(
-            f"WARNING: {isolated}/{N} satellites have no links "
-            f"({isolated / N:.0%}). The topology is sparse; consider relaxing "
-            f"--max_km or raising --max_degree.",
-            file=sys.stderr,
-        )
-    if N > 0 and largest / N < 0.5:
-        print(
-            f"WARNING: largest connected component covers only "
-            f"{largest}/{N} nodes ({largest / N:.0%}). Flow generation in the "
-            f"ns-3 scenario will only use that component.",
-            file=sys.stderr,
-        )
+    any_issue = any(v["issues"] for v in all_validations)
+    if any_issue and args.strict:
+        raise SystemExit("Strict validation failed; see warnings above.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Starlink snapshot explorer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #07090d;
+    --panel: #10141b;
+    --panel-2: #161c26;
+    --ink: #e5ecf2;
+    --ink-dim: #97a3b2;
+    --accent: #4ad6ff;
+    --accent-2: #8affc1;
+    --warn: #ffb347;
+    --err: #ff6a6a;
+    --border: #222a36;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Ubuntu, sans-serif; }
+  #app { display: grid; grid-template-columns: 340px 1fr 320px; height: 100%; }
+  #left, #right { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; }
+  #right { border-right: none; border-left: 1px solid var(--border); }
+  #scene { position: relative; background: #000; }
+  canvas { display: block; }
+  h1, h2, h3 { margin: 0 0 6px; font-weight: 600; }
+  h1 { font-size: 16px; letter-spacing: 0.3px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-dim); margin-top: 16px; }
+  h3 { font-size: 12px; color: var(--ink-dim); }
+  .section { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  label { display: block; font-size: 12px; color: var(--ink-dim); margin-top: 8px; margin-bottom: 4px; }
+  input[type=number], input[type=range], input[type=text], select {
+    width: 100%; background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--border); padding: 6px 8px; font-size: 12px; border-radius: 4px;
+  }
+  input[type=range] { padding: 0; }
+  button { cursor: pointer; background: var(--accent); color: #001622; border: 0;
+    padding: 8px 12px; font-size: 12px; font-weight: 600; border-radius: 4px; width: 100%; }
+  button.secondary { background: var(--panel-2); color: var(--ink); border: 1px solid var(--border); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .kv { font-size: 12px; padding: 4px 0; border-bottom: 1px dashed var(--border); display: flex; justify-content: space-between; }
+  .kv span:last-child { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .hoplist { font-size: 11px; line-height: 1.4; margin-top: 6px; }
+  .hoplist .hop { padding: 6px 8px; background: var(--panel-2); border-radius: 4px; margin-bottom: 4px; }
+  .hoplist .hop b { color: var(--accent-2); }
+  .legend { font-size: 11px; color: var(--ink-dim); line-height: 1.6; }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  #status { position: absolute; left: 12px; bottom: 12px; background: rgba(0,0,0,0.55);
+    padding: 8px 12px; border-radius: 4px; font-size: 11px; color: var(--ink-dim); }
+  #tooltip { position: absolute; pointer-events: none; background: rgba(0,0,0,0.8);
+    padding: 4px 8px; border-radius: 3px; font-size: 11px; color: var(--ink);
+    display: none; z-index: 10; }
+  .muted { color: var(--ink-dim); font-size: 11px; line-height: 1.4; }
+  .pill { display: inline-block; padding: 2px 6px; font-size: 10px;
+          border: 1px solid var(--border); border-radius: 10px; color: var(--ink-dim); margin-right: 4px;}
+  .banner { font-size: 11px; padding: 8px 12px; border-radius: 4px; margin-bottom: 10px; }
+  .banner.warn { background: rgba(255, 179, 71, 0.08); border: 1px solid rgba(255,179,71,0.2); color: var(--warn); }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="left">
+    <div class="section">
+      <h1>Starlink Snapshot Explorer</h1>
+      <div class="muted" style="margin-top:6px">
+        Loads <code>results/snapshot_nodes.csv</code> &amp;
+        <code>results/snapshot_edges.csv</code> and lets you inject traffic
+        to see how packets traverse the constellation.
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Snapshot</h2>
+      <div id="meta-info" class="muted">loading&hellip;</div>
+    </div>
+
+    <div class="section">
+      <h2>Traffic source &amp; destination</h2>
+      <label>Source node</label>
+      <select id="src-select"></select>
+      <label>Destination node</label>
+      <select id="dst-select"></select>
+      <div class="row" style="margin-top:8px">
+        <button id="pick-src" class="secondary">Pick src on map</button>
+        <button id="pick-dst" class="secondary">Pick dst on map</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Packet &amp; link parameters</h2>
+      <div class="row">
+        <div>
+          <label>Packet size (B)</label>
+          <input id="packet-size" type="number" min="64" max="65535" value="1000" />
+        </div>
+        <div>
+          <label>ISL link rate (Mbps)</label>
+          <input id="link-rate" type="number" min="1" max="100000" step="1" value="20" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Access link rate (Mbps)</label>
+          <input id="access-rate" type="number" min="1" max="100000" step="1" value="100" />
+        </div>
+        <div>
+          <label>Queue size (pkts)</label>
+          <input id="queue-size" type="number" min="1" max="100000" value="100" />
+        </div>
+      </div>
+      <label>Offered load per flow</label>
+      <div class="row">
+        <div>
+          <input id="offered-pps" type="number" min="1" max="200000" value="1000" />
+          <div class="muted">packets / s</div>
+        </div>
+        <div>
+          <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0.005" />
+          <div class="muted">per-link loss probability</div>
+        </div>
+      </div>
+      <label>Transport</label>
+      <select id="transport">
+        <option value="tcp" selected>TCP (saturating)</option>
+        <option value="udp">UDP CBR</option>
+      </select>
+    </div>
+
+    <div class="section">
+      <h2>Launch</h2>
+      <div class="row">
+        <button id="launch">Send packet</button>
+        <button id="launch-burst" class="secondary">Burst (50)</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button id="steady" class="secondary">Start steady load</button>
+        <button id="stop" class="secondary">Stop traffic</button>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        Packets are routed by Dijkstra on propagation delay.
+        Per-hop queueing and serialization are estimated from the current
+        offered load and link rate.
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>View</h2>
+      <label>Speed-up vs real time</label>
+      <input id="time-scale" type="range" min="1" max="2000" step="1" value="200" />
+      <div class="muted"><span id="time-scale-label">200x</span> — 1x means packets take their physical delay, 200x shrinks tens of ms into ~50 ms of screen time.</div>
+      <div class="row" style="margin-top:8px">
+        <label style="display:flex;align-items:center;gap:6px;margin:0">
+          <input id="show-isl" type="checkbox" checked /> show ISL edges
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;margin:0">
+          <input id="show-access" type="checkbox" checked /> show access links
+        </label>
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+        <input id="auto-rotate" type="checkbox" /> auto-rotate earth
+      </label>
+    </div>
+  </aside>
+
+  <div id="scene">
+    <div id="tooltip"></div>
+    <div id="status">initialising&hellip;</div>
+  </div>
+
+  <aside id="right">
+    <div class="section">
+      <h2>Selected flow</h2>
+      <div id="flow-summary" class="muted">no flow yet</div>
+    </div>
+    <div class="section">
+      <h2>Hop-by-hop breakdown</h2>
+      <div id="hoplist" class="hoplist"></div>
+    </div>
+    <div class="section">
+      <h2>Aggregate metrics</h2>
+      <div id="metrics" class="muted"></div>
+    </div>
+    <div class="section">
+      <h2>Legend</h2>
+      <div class="legend">
+        <div><span class="dot" style="background:#9ad8ff"></span> intra-plane ISL</div>
+        <div><span class="dot" style="background:#ffe08a"></span> inter-plane ISL</div>
+        <div><span class="dot" style="background:#ff7171"></span> ground access link</div>
+        <div><span class="dot" style="background:#8affc1"></span> satellite</div>
+        <div><span class="dot" style="background:#ff4763"></span> gateway / ground station</div>
+        <div><span class="dot" style="background:#ffffff"></span> selected source / destination</div>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Notes</h2>
+      <div class="muted">
+        Positions are the ECEF projection from the snapshot (a frozen-time
+        view). Propagation delays match the generator's output; serialization
+        and queueing are <em>derived here</em> from your packet size, link
+        rate and offered load — they are not FlowMonitor truth.
+        For real ns-3 numbers run <code>tools/run_ns3_snapshot.sh</code>.
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
