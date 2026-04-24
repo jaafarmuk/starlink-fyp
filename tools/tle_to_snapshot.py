@@ -427,6 +427,121 @@ def filter_operational(
     return kept_sats, kept_srs, dict(reasons)
 
 
+def tle_shell_feature(sr: Satrec) -> Optional[dict]:
+    """Return coarse shell-selection features derived directly from a TLE.
+
+    This is intentionally pre-SGP4 and pre-sampling: for a limited-size
+    experiment, sampling must be done from a coherent orbital family. Randomly
+    mixing all operational Starlink shells creates many disconnected
+    components because this project only models same-shell ISLs.
+    """
+    try:
+        n_rad_min = float(sr.no_kozai)
+        e = float(sr.ecco)
+        inc_deg = math.degrees(float(sr.inclo))
+    except Exception:
+        return None
+    if n_rad_min <= 0.0:
+        return None
+    n_rev_day = n_rad_min * (1440.0 / (2.0 * math.pi))
+    n_rad_s = n_rad_min / 60.0
+    a_km = (EARTH_MU_KM3_S2 / (n_rad_s * n_rad_s)) ** (1.0 / 3.0)
+    perigee_alt_km = a_km * (1.0 - e) - EARTH_RADIUS_KM
+    return {
+        "inc_deg": inc_deg,
+        "perigee_alt_km": perigee_alt_km,
+        "mean_motion_rev_day": n_rev_day,
+    }
+
+
+def select_shell_population(
+    sats: list[tuple[str, str, str]],
+    satrecs: list[Satrec],
+    *,
+    mode: str,
+    inc_tol_deg: float,
+    alt_tol_km: float,
+) -> tuple[list[tuple[str, str, str]], list[Satrec], dict]:
+    """Optionally reduce the candidate population to one coherent shell.
+
+    Realistic small experiments should not randomly sample across all
+    operational shells. The ISL model is same-shell, so a 400-satellite sample
+    spread across many shells is expected to fragment. Selecting the largest
+    shell keeps the sample physically coherent while still using real TLEs.
+    """
+    if mode == "none":
+        return list(sats), list(satrecs), {
+            "mode": "none",
+            "input_tles": len(sats),
+            "selected_tles": len(sats),
+        }
+
+    if mode != "largest":
+        raise ValueError(f"Unknown shell selection mode: {mode}")
+
+    features: list[tuple[int, dict]] = []
+    skipped = 0
+    for i, sr in enumerate(satrecs):
+        f = tle_shell_feature(sr)
+        if f is None:
+            skipped += 1
+            continue
+        features.append((i, f))
+
+    if not features:
+        raise SystemExit("No valid TLEs available for shell selection.")
+
+    by_index = {i: f for i, f in features}
+    inc_groups = _cluster_1d_tolerance(
+        [(f["inc_deg"], i) for i, f in features],
+        max(inc_tol_deg, 1e-6),
+    )
+
+    shell_groups: list[list[int]] = []
+    for ids in inc_groups:
+        alt_groups = _cluster_1d_tolerance(
+            [(by_index[i]["perigee_alt_km"], i) for i in ids],
+            max(alt_tol_km, 1e-6),
+        )
+        shell_groups.extend(alt_groups)
+
+    shell_groups.sort(
+        key=lambda g: (
+            len(g),
+            -abs(np.mean([by_index[i]["inc_deg"] for i in g]) - 53.0),
+        ),
+        reverse=True,
+    )
+    chosen = sorted(shell_groups[0])
+
+    def shell_summary(g: list[int]) -> dict:
+        incs = [by_index[i]["inc_deg"] for i in g]
+        alts = [by_index[i]["perigee_alt_km"] for i in g]
+        mms = [by_index[i]["mean_motion_rev_day"] for i in g]
+        return {
+            "count": len(g),
+            "inc_min_deg": round(min(incs), 4),
+            "inc_max_deg": round(max(incs), 4),
+            "perigee_alt_min_km": round(min(alts), 3),
+            "perigee_alt_max_km": round(max(alts), 3),
+            "mean_motion_min_rev_day": round(min(mms), 8),
+            "mean_motion_max_rev_day": round(max(mms), 8),
+        }
+
+    meta = {
+        "mode": mode,
+        "input_tles": len(sats),
+        "selected_tles": len(chosen),
+        "skipped_bad_tles": skipped,
+        "num_candidate_shells": len(shell_groups),
+        "inc_tol_deg": inc_tol_deg,
+        "alt_tol_km": alt_tol_km,
+        "selected_shell": shell_summary(chosen),
+        "top_shells": [shell_summary(g) for g in shell_groups[:5]],
+    }
+    return [sats[i] for i in chosen], [satrecs[i] for i in chosen], meta
+
+
 # ---------------------------------------------------------------------------
 # Line-of-sight / distance
 # ---------------------------------------------------------------------------
@@ -962,6 +1077,13 @@ def parse_args() -> argparse.Namespace:
                          "the earliest launch IDs, which massively over-"
                          "represents a handful of shells and creates "
                          "fragmented topologies for small --n.")
+    ap.add_argument("--shell_select", choices=["largest", "none"],
+                    default="largest",
+                    help="Select a coherent shell before sampling. The "
+                         "default 'largest' is the realistic choice for "
+                         "limited-size experiments because this project "
+                         "models same-shell ISLs; use 'none' only when you "
+                         "intentionally want a multi-shell population.")
     ap.add_argument("--seed", type=int, default=None)
 
     # Operational-satellite filters (review: TLE dataset mixes operational,
@@ -1381,16 +1503,32 @@ def main():
             "All TLEs were filtered out. Loosen --min_altitude_km / "
             "--max_altitude_km / --max_eccentricity / mean-motion bounds.")
 
+    shell_tles, shell_srs, shell_selection = select_shell_population(
+        filtered_tles, filtered_srs,
+        mode=args.shell_select,
+        inc_tol_deg=args.inc_tol_deg,
+        alt_tol_km=args.alt_tol_km,
+    )
+    if args.shell_select != "none":
+        sel = shell_selection["selected_shell"]
+        print(
+            "Shell selection kept "
+            f"{shell_selection['selected_tles']}/{shell_selection['input_tles']} "
+            "post-filter TLEs "
+            f"(inc {sel['inc_min_deg']}-{sel['inc_max_deg']} deg, "
+            f"perigee alt {sel['perigee_alt_min_km']}-"
+            f"{sel['perigee_alt_max_km']} km).")
+
     if args.sample == "random":
         rng = np.random.default_rng(args.seed)
-        idx = rng.choice(len(filtered_tles),
-                         size=min(args.n, len(filtered_tles)),
+        idx = rng.choice(len(shell_tles),
+                         size=min(args.n, len(shell_tles)),
                          replace=False)
-        raw_sats = [filtered_tles[i] for i in sorted(idx.tolist())]
-        satrecs = [filtered_srs[i] for i in sorted(idx.tolist())]
+        raw_sats = [shell_tles[i] for i in sorted(idx.tolist())]
+        satrecs = [shell_srs[i] for i in sorted(idx.tolist())]
     else:
-        raw_sats = filtered_tles[:args.n]
-        satrecs = filtered_srs[:args.n]
+        raw_sats = shell_tles[:args.n]
+        satrecs = shell_srs[:args.n]
 
     jd, fr, epoch_mode = resolve_common_epoch(args, satrecs)
     if epoch_mode == "per-tle-epoch":
@@ -1550,6 +1688,7 @@ def main():
         "sampling": {
             "mode": args.sample, "n": args.n, "seed": args.seed,
             "tle_file": os.path.abspath(args.tle),
+            "shell_selection": shell_selection,
         },
         "cli": {k: getattr(args, k) for k in vars(args)},
         "validation_per_step": all_validations,

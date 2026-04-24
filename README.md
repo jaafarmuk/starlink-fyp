@@ -73,13 +73,42 @@ On Windows PowerShell, activate with:
 pip install -r requirements.txt
 ```
 
-### 2. Generate A Snapshot
+### 2. Get Or Update Starlink TLE Data
+
+The repository already includes `datasets/starlink.tle`. To refresh it from
+CelesTrak's current Starlink GP/TLE feed, use one of these commands.
+
+PowerShell:
+
+```powershell
+Invoke-WebRequest "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle" -OutFile datasets\starlink.tle
+```
+
+Bash:
+
+```bash
+curl -L "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle" -o datasets/starlink.tle
+```
+
+CelesTrak also provides supplemental Starlink GP data derived from SpaceX
+public ephemeris data, but this project currently consumes standard TLE/3LE
+text files.
+
+### 3. Generate A Realistic Limited-Size Snapshot
 
 The recommended command filters the raw TLE file to a cleaner operational
-Starlink-like subset:
+Starlink-like subset, selects one coherent shell, and then samples from that
+shell. This avoids the unrealistic mistake of mixing many shells into one
+small fragmented topology.
 
 ```bash
 tools/generate_snapshot.sh --n 400 --sample random --seed 1 --starlink_operational
+```
+
+Equivalent PowerShell command:
+
+```powershell
+python tools\tle_to_snapshot.py --tle datasets\starlink.tle --n 400 --sample random --seed 1 --starlink_operational --edges_out results\snapshot_edges.csv --nodes_out results\snapshot_nodes.csv --stats_out results\topology_stats.csv --meta_out results\snapshot_meta.json
 ```
 
 This creates:
@@ -91,7 +120,11 @@ results/snapshot_meta.json
 results/topology_stats.csv
 ```
 
-### 3. Run With ns-3
+By default, `--shell_select largest` is enabled. Use `--shell_select none`
+only if you intentionally want a multi-shell population and understand that
+the resulting graph may fragment.
+
+### 4. Run With ns-3
 
 Install/build ns-3 first. By default, the wrapper expects the ns-3 checkout at:
 
@@ -127,7 +160,7 @@ tools/run_ns3_snapshot.sh --numFlows=8 --simTime=20 --flowPattern=gateway
 tools/run_ns3_snapshot.sh --rate=1Gbps --accessRate=1Gbps --queueSize=1000p
 ```
 
-### 4. Run The Visualizer
+### 5. Run The Visualizer
 
 Serve the repository locally:
 
@@ -144,7 +177,7 @@ http://localhost:8000/tools/visualizer/
 The visualizer reads the generated `results/snapshot_nodes.csv`,
 `results/snapshot_edges.csv`, and `results/snapshot_meta.json`.
 
-### 5. Plot ns-3 Flow Metrics
+### 6. Plot ns-3 Flow Metrics
 
 After running ns-3:
 
@@ -390,9 +423,10 @@ important for finding bottlenecks.
 - Built-in gateways are demo placeholders.
 - Weather, obstruction, spectrum sharing, and real user terminal behavior are outside the scope.
 
-## Recommended Run For Cleaner Results
+## Recommended Run
 
-For a more reasonable demo snapshot:
+For a strict, realistic limited-size snapshot from one coherent operational
+shell:
 
 ```bash
 tools/generate_snapshot.sh --n 400 --sample random --seed 1 --starlink_operational
@@ -400,8 +434,8 @@ tools/run_ns3_snapshot.sh
 python tools/plot_flow_metrics.py
 ```
 
-For exploratory runs that may produce fragmented or unrealistic topologies:
+For exploratory multi-shell runs that may fragment:
 
 ```bash
-tools/generate_snapshot.sh --n 200 --sample random --seed 1 --no_strict
+tools/generate_snapshot.sh --n 400 --sample random --seed 1 --starlink_operational --shell_select none --no_strict
 ```
