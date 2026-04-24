@@ -1,6 +1,0 @@
-schema_version=2.0.0
-flow_index,src_node,dst_node,port,transport,offered_load_mbps,goodput_mbps,delivery_ratio_percent,packet_loss_percent,tcp_retrans_overhead_percent,mean_delay_ms,mean_jitter_ms,hop_count_unweighted,shortest_delay_ms,tx_packets,rx_packets,lost_packets,tx_bytes,rx_bytes
-0,27,31,9000,tcp,0.0,7.39913,99.9667,NaN,0.033,3.412,0.0,1,3.0754,9000,8997,0,9000000,8997000
-3,27,34,9003,tcp,0.0,7.38433,99.7667,NaN,0.233,21.236,0.0,3,5.976,9000,8979,0,9000000,8979000
-1,31,34,9001,tcp,0.0,7.38433,99.7667,NaN,0.233,21.824,0.0,2,0.4209,9000,8979,0,9000000,8979000
-2,34,35,9002,tcp,0.0,7.38926,99.8333,NaN,0.167,15.412,0.0,3,0.1360,9000,8985,0,9000000,8985000

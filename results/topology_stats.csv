@@ -1,2 +1,0 @@
-step,epoch_utc,num_nodes,num_satellites,num_gateways,num_edges,num_isl,num_access,num_shells,num_components,largest_cc_size,isolated_nodes,mean_isl_km,max_isl_km,min_isl_km,mean_access_km
-0,2026-03-21T20:24:42.869Z,210,200,10,332,319,13,2,7,197,4,2206.72,4881.78,8.78,675.1

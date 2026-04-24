@@ -747,6 +747,7 @@ int main(int argc, char* argv[])
     const double W = 2000.0, H = 1000.0;
     for (uint32_t i = 0; i < N; ++i)
     {
+<<<<<<< HEAD
       double lat = 0.0, lon = 0.0;
       std::string desc = "Node-" + std::to_string(i);
       if (i < nodeInfoById.size())
@@ -764,6 +765,12 @@ int main(int argc, char* argv[])
       {
         anim->UpdateNodeColor(nodes.Get(i), 220, 60, 60);
       }
+=======
+      double x = (i % 10) * 50.0;
+      double y = (i / 10) * 50.0;
+      AnimationInterface::SetConstantPosition(nodes.Get(i), x, y);
+      anim->UpdateNodeDescription(nodes.Get(i), "Sat-" + std::to_string(i));
+>>>>>>> 731854a6d4c9a3b767737e451949f4921a4b5044
     }
   }
 
