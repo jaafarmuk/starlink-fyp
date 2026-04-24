@@ -1,17 +1,38 @@
 """
 Starlink / LEO TLE -> network snapshot generator.
 
-Design goals (addresses items 1-9, 24-30 of the review):
+Important caveats
+-----------------
+This tool builds a PHYSICALLY PLAUSIBLE topology from a TLE file. It is
+explicitly NOT a model of the real Starlink network:
+
+  * ISL existence/choice is a geometric heuristic (same-shell, near-neighbour
+    planes, LoS). Real SpaceX ISL schedules, terminal counts, and beam/slot
+    assignments are proprietary and not represented here.
+  * Built-in gateway locations are labelled `GW-DEMO-*`. They are NOT a
+    claim about real Starlink gateway/PoP sites. Pass --gateways_csv for a
+    real gateway list.
+  * The emitted per-edge `delay_ms` is ONE-WAY SPEED-OF-LIGHT VACUUM
+    propagation. It is not user-perceived latency (which depends on
+    serialisation, queueing, scheduling, gateway hops, internet transit,
+    retransmissions, etc.).
+  * A TLE file conflates operational, orbit-raising, and deorbiting sats.
+    Use --starlink_operational (or the fine-grained filters) to restrict to
+    the operational Starlink shells.
+
+Design goals
+------------
   * Every satellite is propagated to ONE common epoch. --utc is the default
     policy (median TLE epoch if omitted). Per-satellite epoch mode is opt-in
     and emits a warning because it is physically inconsistent for a topology.
   * Plane/shell grouping is derived from propagated orbital elements at the
     evaluation epoch (inclination + RAAN + semi-major axis), never from stale
     TLE text fields.
-  * Plane clustering uses inclination+altitude to define a SHELL, then RAAN
-    within a shell. RAAN statistics are computed with circular means.
-  * Clustering uses a center-based rule with true angular tolerance, not
-    single-linkage chaining over sorted neighbours.
+  * Shell clustering is DIAMETER-BOUNDED in (inclination, altitude): a group
+    cannot grow beyond the configured tolerance on either axis, so we do
+    not single-linkage-chain across wide spreads.
+  * Plane clustering (RAAN within a shell) is mean-shift style on the circle
+    with angular tolerance.
   * In-plane ordering uses argument of latitude (u = omega + nu) — a real
     along-track orbital coordinate — not ECI atan2(y,x).
   * Inter-plane ISL candidates are restricted to the SAME SHELL, with
@@ -48,7 +69,9 @@ import pandas as pd
 from sgp4.api import Satrec
 
 
-SCHEMA_VERSION = "2.0.0"
+SCHEMA_VERSION = "2.1.0"
+# Readers should also accept older schemas known to be compatible.
+COMPATIBLE_SCHEMAS = ("2.0.0", "2.1.0")
 
 EARTH_RADIUS_KM = 6378.137            # WGS84 equatorial radius
 EARTH_FLATTENING = 1.0 / 298.257223563
@@ -318,6 +341,93 @@ def tle_epoch_jd(satrec: Satrec) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Operational-satellite filtering. A raw TLE file mixes operational sats
+# with orbit-raising (low, climbing) and deorbiting / deorbited (decaying)
+# sats. For Starlink, operational shells are within a narrow altitude band
+# at low eccentricity; the helper below drops TLEs that fall outside the
+# requested envelope BEFORE SGP4 propagation so downstream stats are not
+# contaminated.
+# ---------------------------------------------------------------------------
+
+# Operational Starlink defaults. Verify against the FCC grant and SpaceX
+# filings before citing; these are deliberately conservative:
+#   * altitude 400-600 km captures Gen1 (~540-570) and Gen2 lower shells
+#     (~525-535). Does NOT include planned high-inclination variants.
+#   * eccentricity < 0.01 excludes obvious orbit-raising ellipses.
+#   * mean motion 14.9-15.7 rev/day covers ~510-620 km circular orbits.
+STARLINK_DEFAULTS = {
+    "min_altitude_km": 400.0,
+    "max_altitude_km": 600.0,
+    "max_eccentricity": 0.01,
+    "min_mean_motion_rev_day": 14.9,
+    "max_mean_motion_rev_day": 15.7,
+}
+
+
+def filter_operational(
+    sats: list[tuple[str, str, str]],
+    satrecs: list[Satrec],
+    *,
+    min_altitude_km: Optional[float],
+    max_altitude_km: Optional[float],
+    max_eccentricity: Optional[float],
+    min_mean_motion_rev_day: Optional[float],
+    max_mean_motion_rev_day: Optional[float],
+) -> tuple[list[tuple[str, str, str]], list[Satrec], dict]:
+    """Drop TLEs outside the operational envelope.
+
+    Returns (kept_sats, kept_satrecs, reasons) where `reasons` is a counter
+    of why entries were dropped.
+    """
+    if all(v is None for v in (
+            min_altitude_km, max_altitude_km, max_eccentricity,
+            min_mean_motion_rev_day, max_mean_motion_rev_day)):
+        return list(sats), list(satrecs), {}
+
+    kept_sats = []
+    kept_srs = []
+    reasons: Counter = Counter()
+    for triple, sr in zip(sats, satrecs):
+        # SGP4 exposes mean motion (no_kozai) in rad/min and eccentricity.
+        # The semi-major axis can be derived from n via Kepler's third law.
+        try:
+            n_rad_min = float(sr.no_kozai)
+            e = float(sr.ecco)
+        except Exception:
+            reasons["bad_tle"] += 1
+            continue
+        if n_rad_min <= 0.0:
+            reasons["bad_mean_motion"] += 1
+            continue
+        n_rev_day = n_rad_min * (1440.0 / (2.0 * math.pi))
+        # a = (mu / n^2)^(1/3), with n in rad/s
+        n_rad_s = n_rad_min / 60.0
+        a_km = (EARTH_MU_KM3_S2 / (n_rad_s * n_rad_s)) ** (1.0 / 3.0)
+        perigee_alt = a_km * (1.0 - e) - EARTH_RADIUS_KM
+
+        if min_altitude_km is not None and perigee_alt < min_altitude_km:
+            reasons["below_min_altitude"] += 1
+            continue
+        if max_altitude_km is not None and perigee_alt > max_altitude_km:
+            reasons["above_max_altitude"] += 1
+            continue
+        if max_eccentricity is not None and e > max_eccentricity:
+            reasons["eccentric"] += 1
+            continue
+        if (min_mean_motion_rev_day is not None
+                and n_rev_day < min_mean_motion_rev_day):
+            reasons["slow_orbit"] += 1
+            continue
+        if (max_mean_motion_rev_day is not None
+                and n_rev_day > max_mean_motion_rev_day):
+            reasons["fast_orbit"] += 1
+            continue
+        kept_sats.append(triple)
+        kept_srs.append(sr)
+    return kept_sats, kept_srs, dict(reasons)
+
+
+# ---------------------------------------------------------------------------
 # Line-of-sight / distance
 # ---------------------------------------------------------------------------
 
@@ -346,23 +456,28 @@ def distance_km(r1, r2) -> float:
 
 def _cluster_1d_tolerance(values_and_ids: list[tuple[float, int]],
                           tol: float) -> list[list[int]]:
-    """Sort by value and split into groups whenever two adjacent values differ
-    by more than `tol`. Each group's range is bounded by `tol` x gap count,
-    not by a global centre, so physically similar items near bin boundaries
-    do not split. Non-angular values only (use elsewhere for RAAN, etc.).
+    """Diameter-bounded 1-D clustering on a non-angular axis.
+
+    Sorts by value and starts a NEW group whenever adding the next point
+    would make the group's total span exceed `tol`. This is stricter than
+    adjacent-gap single-linkage: with single-linkage, a long ladder of
+    points each within `tol` of the last can produce a group whose first
+    and last points differ by arbitrarily much. Here the group span is
+    always <= tol, which matches what a shell / orbit family actually
+    looks like (a narrow altitude/inclination band).
     """
     if not values_and_ids:
         return []
     ordered = sorted(values_and_ids, key=lambda t: t[0])
-    groups: list[list[int]] = [[ordered[0][1]]]
-    prev = ordered[0][0]
+    groups: list[list[tuple[float, int]]] = [[ordered[0]]]
+    group_min = ordered[0][0]
     for v, sid in ordered[1:]:
-        if v - prev <= tol:
-            groups[-1].append(sid)
+        if (v - group_min) > tol:
+            groups.append([(v, sid)])
+            group_min = v
         else:
-            groups.append([sid])
-        prev = v
-    return groups
+            groups[-1].append((v, sid))
+    return [[sid for _, sid in g] for g in groups]
 
 
 def cluster_shells(sats: list[dict],
@@ -479,10 +594,15 @@ def order_by_argument_of_latitude(plane_sat_ids: list[int],
 @dataclass
 class IslPolicy:
     max_km: float = 5000.0
+    min_km: float = 0.0
     max_degree: int = 4
     intra_plane_neighbours: int = 2
     allowed_plane_offsets: tuple = (-2, -1, 1, 2)
-    min_elevation_angle_deg: float = -90.0  # relative to horizon at midpoint
+    # Minimum angle between the ISL vector and each endpoint's local
+    # horizontal plane (the plane orthogonal to that satellite's geocentric
+    # position vector). This is an ISL grazing-angle check, not a
+    # ground-station elevation mask. -90 disables the check.
+    min_isl_grazing_angle_deg: float = -90.0
     disable_above_abs_lat_deg: float = 70.0  # seam avoidance for inclined shells
     apply_seam_avoidance: bool = True
 
@@ -552,6 +672,11 @@ def try_add_edge(u_id: int,
     limit = extra_range_km if extra_range_km is not None else policy.max_km
     if d > limit:
         return False
+    if d < policy.min_km:
+        # Reject implausibly short ISLs — these usually indicate two TLEs
+        # for the same physical satellite, a near-collision pair at a
+        # plane crossing, or TLE epoch contamination.
+        return False
     if not has_line_of_sight(r1, r2):
         return False
 
@@ -560,11 +685,11 @@ def try_add_edge(u_id: int,
         if mid_lat > policy.disable_above_abs_lat_deg:
             return False
 
-    # Reject ISLs whose endpoints see each other below the local horizon
-    # (grazing links with implausibly low elevation angles).
-    if policy.min_elevation_angle_deg > -90.0:
+    # Reject ISLs whose endpoints see each other below each one's local
+    # horizontal plane (grazing links with implausibly low angles).
+    if policy.min_isl_grazing_angle_deg > -90.0:
         min_elev = link_min_elevation_deg(r1, r2)
-        if min_elev < policy.min_elevation_angle_deg:
+        if min_elev < policy.min_isl_grazing_angle_deg:
             return False
 
     delay_ms = (d / C_KM_S) * 1000.0
@@ -602,20 +727,22 @@ def ring_neighbors(ordered_ids: list[int], sid: int, count: int) -> list[int]:
 # Ground gateways (review items 25, 26)
 # ---------------------------------------------------------------------------
 
-# A small built-in set of representative public gateway locations. This is
-# NOT an official Starlink gateway list — it is a reasonable default so the
-# scenario is not sat-only. Override with --gateways_csv for real studies.
+# A small built-in set of demo ground-station locations. These coordinates
+# are major-city centroids, NOT real Starlink gateway or PoP sites. They
+# exist only so a snapshot is not sat-only when no --gateways_csv is given.
+# Every entry is prefixed DEMO- so downstream tools and visualisations can
+# surface that these are synthetic placeholders.
 DEFAULT_GATEWAYS = [
-    ("LON",   51.5074,   -0.1278, 0.03),
-    ("NYC",   40.7128,  -74.0060, 0.02),
-    ("LAX",   33.9416, -118.4085, 0.04),
-    ("SEA",   47.4502, -122.3088, 0.06),
-    ("FRA",   50.1109,    8.6821, 0.11),
-    ("SIN",    1.3521,  103.8198, 0.02),
-    ("SYD",  -33.8688,  151.2093, 0.06),
-    ("TYO",   35.6762,  139.6503, 0.04),
-    ("GRU",  -23.5505,  -46.6333, 0.76),
-    ("JNB",  -26.2041,   28.0473, 1.75),
+    ("DEMO-LON",   51.5074,   -0.1278, 0.03),
+    ("DEMO-NYC",   40.7128,  -74.0060, 0.02),
+    ("DEMO-LAX",   33.9416, -118.4085, 0.04),
+    ("DEMO-SEA",   47.4502, -122.3088, 0.06),
+    ("DEMO-FRA",   50.1109,    8.6821, 0.11),
+    ("DEMO-SIN",    1.3521,  103.8198, 0.02),
+    ("DEMO-SYD",  -33.8688,  151.2093, 0.06),
+    ("DEMO-TYO",   35.6762,  139.6503, 0.04),
+    ("DEMO-GRU",  -23.5505,  -46.6333, 0.76),
+    ("DEMO-JNB",  -26.2041,   28.0473, 1.75),
 ]
 
 
@@ -830,8 +957,28 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--n", type=int, default=60,
                     help="Number of TLEs to sample (after filtering).")
-    ap.add_argument("--sample", choices=["head", "random"], default="head")
+    ap.add_argument("--sample", choices=["head", "random"], default="random",
+                    help="Default is 'random' because 'head' biases toward "
+                         "the earliest launch IDs, which massively over-"
+                         "represents a handful of shells and creates "
+                         "fragmented topologies for small --n.")
     ap.add_argument("--seed", type=int, default=None)
+
+    # Operational-satellite filters (review: TLE dataset mixes operational,
+    # orbit-raising and deorbiting sats).
+    ap.add_argument("--starlink_operational", action="store_true",
+                    help="Apply conservative Starlink operational filters "
+                         "(altitude 400-600 km, ecc <0.01, mean motion "
+                         "14.9-15.7 rev/day). Individual filters below "
+                         "override this.")
+    ap.add_argument("--min_altitude_km", type=float, default=None,
+                    help="Drop TLEs whose perigee altitude is below this.")
+    ap.add_argument("--max_altitude_km", type=float, default=None,
+                    help="Drop TLEs whose perigee altitude is above this.")
+    ap.add_argument("--max_eccentricity", type=float, default=None,
+                    help="Drop TLEs with eccentricity above this threshold.")
+    ap.add_argument("--min_mean_motion_rev_day", type=float, default=None)
+    ap.add_argument("--max_mean_motion_rev_day", type=float, default=None)
 
     ap.add_argument("--utc", default=None,
                     help="Common propagation epoch as ISO-8601 UTC. "
@@ -843,6 +990,11 @@ def parse_args() -> argparse.Namespace:
                          "inconsistent; not recommended.")
 
     ap.add_argument("--max_km", type=float, default=5000.0)
+    ap.add_argument("--min_isl_km", type=float, default=100.0,
+                    help="Reject ISLs shorter than this (km). Very short "
+                         "inter-satellite links usually indicate a TLE epoch "
+                         "problem or a near-collision at a plane crossing "
+                         "and are not representative of operational ISLs.")
     ap.add_argument("--max_degree", type=int, default=4)
     ap.add_argument("--intra_plane", type=int, default=2)
     ap.add_argument("--inter_plane", type=int, default=2)
@@ -874,8 +1026,16 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--min_largest_cc_frac", type=float, default=0.5)
     ap.add_argument("--max_isolated_frac", type=float, default=0.25)
-    ap.add_argument("--strict", action="store_true",
-                    help="Fail (exit non-zero) when validation finds issues.")
+    # Strict is the default: we would rather loudly fail than silently emit
+    # a topology where half the nodes are isolated. --no_strict reverts to
+    # warning-only for exploratory runs.
+    strict_grp = ap.add_mutually_exclusive_group()
+    strict_grp.add_argument("--strict", dest="strict", action="store_true",
+                            help="Exit non-zero when validation finds issues "
+                                 "(default).")
+    strict_grp.add_argument("--no_strict", dest="strict", action="store_false",
+                            help="Downgrade validation errors to warnings.")
+    ap.set_defaults(strict=True)
 
     return ap.parse_args()
 
@@ -1011,6 +1171,7 @@ def build_snapshot(args,
 
     policy = IslPolicy(
         max_km=args.max_km,
+        min_km=max(0.0, float(args.min_isl_km)),
         max_degree=args.max_degree,
         intra_plane_neighbours=args.intra_plane,
         allowed_plane_offsets=tuple(
@@ -1074,7 +1235,8 @@ def build_snapshot(args,
                         continue
                     r1, r2 = sats_by_id[sid]["r_eci"], sats_by_id[nid]["r_eci"]
                     d = distance_km(r1, r2)
-                    if d <= policy.max_km and has_line_of_sight(r1, r2):
+                    if (policy.min_km <= d <= policy.max_km
+                            and has_line_of_sight(r1, r2)):
                         candidates.append((d, nid))
 
             candidates.sort(key=lambda x: x[0])
@@ -1130,9 +1292,13 @@ def build_snapshot(args,
             "degree": degree[gs["id"]],
         })
 
+    # prop_delay_ms is the canonical column name (schema 2.1.0): it is one-
+    # way vacuum speed-of-light propagation time, NOT latency. delay_ms is
+    # a deprecated alias kept so schema-2.0.0 readers do not break.
     edge_rows = [{
         "u": e["u"], "v": e["v"],
         "distance_km": e["distance_km"],
+        "prop_delay_ms": e["delay_ms"],
         "delay_ms": e["delay_ms"],
         "kind": e["kind"],
         "shell_id": e["shell_id"],
@@ -1172,22 +1338,59 @@ def atomic_write_json(obj, path: str) -> None:
         raise
 
 
+def _resolve_filter(args) -> dict:
+    """Merge the convenience --starlink_operational preset with any
+    per-field overrides. Explicit CLI values always win over the preset.
+    """
+    base = dict.fromkeys(STARLINK_DEFAULTS.keys(), None)
+    if args.starlink_operational:
+        base.update(STARLINK_DEFAULTS)
+    for k in base.keys():
+        v = getattr(args, k, None)
+        if v is not None:
+            base[k] = v
+    return base
+
+
 def main():
     args = parse_args()
+
+    if args.epoch_steps > 1 and not (
+            args.multi_epoch_seconds and args.multi_epoch_seconds > 0.0):
+        raise SystemExit(
+            "--epoch_steps > 1 requires --multi_epoch_seconds > 0; "
+            "otherwise every step reports the same epoch.")
 
     all_tles = read_tles(args.tle)
     if not all_tles:
         raise SystemExit(f"No TLEs found in {args.tle}")
 
+    # Parse all TLEs, then apply operational filters BEFORE sampling so
+    # --n operates on the post-filter population (otherwise a small head
+    # sample of a contaminated file stays contaminated).
+    all_satrecs = [Satrec.twoline2rv(l1, l2) for _, l1, l2 in all_tles]
+    filt = _resolve_filter(args)
+    filtered_tles, filtered_srs, filter_reasons = filter_operational(
+        all_tles, all_satrecs, **filt)
+    dropped = len(all_tles) - len(filtered_tles)
+    if dropped:
+        print(f"Operational filter dropped {dropped}/{len(all_tles)} TLEs "
+              f"({filter_reasons}).")
+    if not filtered_tles:
+        raise SystemExit(
+            "All TLEs were filtered out. Loosen --min_altitude_km / "
+            "--max_altitude_km / --max_eccentricity / mean-motion bounds.")
+
     if args.sample == "random":
         rng = np.random.default_rng(args.seed)
-        idx = rng.choice(len(all_tles), size=min(args.n, len(all_tles)),
+        idx = rng.choice(len(filtered_tles),
+                         size=min(args.n, len(filtered_tles)),
                          replace=False)
-        raw_sats = [all_tles[i] for i in sorted(idx.tolist())]
+        raw_sats = [filtered_tles[i] for i in sorted(idx.tolist())]
+        satrecs = [filtered_srs[i] for i in sorted(idx.tolist())]
     else:
-        raw_sats = all_tles[:args.n]
-
-    satrecs = [Satrec.twoline2rv(l1, l2) for _, l1, l2 in raw_sats]
+        raw_sats = filtered_tles[:args.n]
+        satrecs = filtered_srs[:args.n]
 
     jd, fr, epoch_mode = resolve_common_epoch(args, satrecs)
     if epoch_mode == "per-tle-epoch":
@@ -1197,13 +1400,32 @@ def main():
 
     # Gateway set
     gateways: list[tuple[str, float, float, float]] = []
+    gateway_source = "disabled"
     if args.no_gateways:
         gateways = []
+        gateway_source = "disabled"
     elif args.gateways_csv:
         if args.gateways_csv.strip():
             gateways = read_gateway_csv(args.gateways_csv)
+            gateway_source = "csv"
     else:
         gateways = list(DEFAULT_GATEWAYS)
+        gateway_source = "builtin_demo"
+        print(
+            "WARNING: using built-in DEMO gateway locations. These are city "
+            "centroids, NOT real Starlink gateway sites. Pass --gateways_csv "
+            "with authoritative locations for real studies.",
+            file=sys.stderr,
+        )
+
+    # CSV safety: forbid commas inside gateway names so downstream CSV
+    # readers (which are delimiter-splitting, not fully RFC 4180 compliant)
+    # cannot be confused by a rogue name.
+    for (gname, _, _, _) in gateways:
+        if "," in gname or '"' in gname:
+            raise SystemExit(
+                f"Gateway name {gname!r} contains comma/quote; rename it "
+                "so CSV consumers do not need quote-aware parsing.")
 
     epoch_steps = max(1, args.epoch_steps)
     step_dt_s = args.multi_epoch_seconds or 0.0
@@ -1293,6 +1515,7 @@ def main():
         "queueing_model": "in_ns3",
         "isl_policy": {
             "max_km": args.max_km,
+            "min_km": max(0.0, float(args.min_isl_km)),
             "max_degree": args.max_degree,
             "intra_plane_neighbours": args.intra_plane,
             "inter_plane_offsets_max": args.inter_plane,
@@ -1302,16 +1525,28 @@ def main():
             "inc_tol_deg": args.inc_tol_deg,
             "alt_tol_km": args.alt_tol_km,
         },
+        "tle_filter": {
+            "starlink_operational_preset": bool(args.starlink_operational),
+            "effective": filt,
+            "dropped": dropped,
+            "dropped_reasons": filter_reasons,
+            "input_tles": len(all_tles),
+            "post_filter_tles": len(filtered_tles),
+        },
         "gateway_policy": {
             "enabled": bool(gateways) and not args.no_gateways,
             "min_elevation_deg": args.gs_min_elevation_deg,
             "max_range_km": args.gs_max_range_km,
             "max_sats_per_gs": args.gs_max_sats,
             "max_gs_per_sat": args.gs_max_per_sat,
-            "source": ("csv" if args.gateways_csv else
-                       "disabled" if args.no_gateways else "builtin"),
+            "source": gateway_source,
+            "is_demo_only": gateway_source == "builtin_demo",
             "count": len([g for g in gateways]) if not args.no_gateways else 0,
         },
+        "delay_field_meaning": (
+            "edge delay_ms is one-way vacuum speed-of-light propagation only; "
+            "real end-to-end latency also includes serialisation, queueing, "
+            "scheduling, gateway/PoP hops and internet transit."),
         "sampling": {
             "mode": args.sample, "n": args.n, "seed": args.seed,
             "tle_file": os.path.abspath(args.tle),

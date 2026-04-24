@@ -61,7 +61,11 @@
 
 using namespace ns3;
 
-static constexpr const char* SCHEMA_VERSION = "2.0.0";
+static constexpr const char* SCHEMA_VERSION = "2.1.0";
+// Older snapshot schemas that this scenario still accepts. Keep the list
+// small and explicit — accepting everything silently masks real schema
+// drift.
+static const std::vector<std::string> ACCEPTED_SCHEMAS = {"2.0.0", "2.1.0"};
 
 struct Edge
 {
@@ -117,18 +121,62 @@ struct PerFlowRow
 };
 
 // ---------------------------------------------------------------------------
+// Per-device PhyTxEnd accumulator. Used to measure true on-wire byte counts
+// per net device so we can report real per-link utilization (not just the
+// path-summed upper bound). Declared as a free function so ns-3's
+// MakeBoundCallback can bind the counter pointer and index cleanly.
+// ---------------------------------------------------------------------------
+static void
+AccumDevTxBytes(std::vector<uint64_t>* counters, uint32_t deviceIndex,
+                Ptr<const Packet> p)
+{
+  if (counters && deviceIndex < counters->size())
+  {
+    (*counters)[deviceIndex] += p->GetSize();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CSV helpers (tolerant of column ordering; header-driven).
 // ---------------------------------------------------------------------------
 
+// RFC-4180-lite splitter: handles double-quoted fields containing commas and
+// escaped "" inside quotes. Falls back to a plain comma split when no quotes
+// are present. The generator currently guarantees no commas in fields, but
+// the parser is defensive so a user-provided CSV cannot silently corrupt the
+// topology if a field ever needs quoting.
 static std::vector<std::string> SplitCsvLine(const std::string& line)
 {
   std::vector<std::string> cells;
-  std::stringstream ss(line);
-  std::string cell;
-  while (std::getline(ss, cell, ','))
+  if (line.find('"') == std::string::npos)
   {
-    cells.push_back(cell);
+    std::stringstream ss(line);
+    std::string cell;
+    while (std::getline(ss, cell, ',')) cells.push_back(cell);
+    return cells;
   }
+  std::string cur;
+  bool inQuote = false;
+  for (size_t i = 0; i < line.size(); ++i)
+  {
+    char c = line[i];
+    if (inQuote)
+    {
+      if (c == '"')
+      {
+        if (i + 1 < line.size() && line[i + 1] == '"') { cur.push_back('"'); ++i; }
+        else inQuote = false;
+      }
+      else cur.push_back(c);
+    }
+    else
+    {
+      if (c == ',') { cells.push_back(cur); cur.clear(); }
+      else if (c == '"' && cur.empty()) inQuote = true;
+      else cur.push_back(c);
+    }
+  }
+  cells.push_back(cur);
   return cells;
 }
 
@@ -198,12 +246,20 @@ ReadEdgesCsv(const std::string& path, uint32_t& outMaxId)
     e.u = static_cast<uint32_t>(std::stoul(GetOr(cells, idx, "u")));
     e.v = static_cast<uint32_t>(std::stoul(GetOr(cells, idx, "v")));
     e.distanceKm = StodOr(GetOr(cells, idx, "distance_km"), 0.0);
-    e.delayMs = StodOr(GetOr(cells, idx, "delay_ms"), 0.0);
+    // Schema 2.1.0 canonical name is prop_delay_ms (one-way vacuum
+    // propagation). Schema 2.0.0 wrote this as delay_ms, which is kept as
+    // a deprecated alias. Prefer the new name, fall back to the old.
+    double propDelay = StodOr(GetOr(cells, idx, "prop_delay_ms"), 0.0);
+    if (propDelay <= 0.0)
+    {
+      propDelay = StodOr(GetOr(cells, idx, "delay_ms"), 0.0);
+    }
+    e.delayMs = propDelay;
     e.kind = GetOr(cells, idx, "kind", "unknown");
     e.shellId = StoiOr(GetOr(cells, idx, "shell_id"), -1);
     if (e.delayMs <= 0.0)
     {
-      // Fall back to geometry if the CSV lacks delay_ms.
+      // Fall back to geometry if both column names are missing / empty.
       e.delayMs = (e.distanceKm / 299792.458) * 1000.0;
     }
     maxId = std::max(maxId, std::max(e.u, e.v));
@@ -289,11 +345,22 @@ CheckMetadataSchema(const std::string& path)
   auto closeQuote = blob.find('"', openQuote + 1);
   if (closeQuote == std::string::npos) return true;
   std::string ver = blob.substr(openQuote + 1, closeQuote - openQuote - 1);
-  if (ver != SCHEMA_VERSION)
+  bool accepted = false;
+  for (const auto& s : ACCEPTED_SCHEMAS)
+  {
+    if (ver == s) { accepted = true; break; }
+  }
+  if (!accepted)
   {
     NS_FATAL_ERROR("Snapshot schema " << ver
-                   << " does not match scenario-expected " << SCHEMA_VERSION
-                   << " (regenerate snapshot with the matching tools/).");
+                   << " is not in the scenario's accepted list "
+                   << "(regenerate snapshot with the matching tools/).");
+  }
+  if (ver != SCHEMA_VERSION)
+  {
+    std::cerr << "INFO: snapshot schema " << ver
+              << " is older than scenario schema " << SCHEMA_VERSION
+              << "; reading in backwards-compatible mode.\n";
   }
   return true;
 }
@@ -640,12 +707,27 @@ int main(int argc, char* argv[])
   double simTime = 10.0;
   double appStart = 1.0;
   uint32_t numFlows = 4;
-  uint32_t packetSize = 1000;
-  std::string rate = "20Mbps";
-  std::string accessRate = "100Mbps";
-  std::string queueSize = "100p";
+  // 1400 B is closer to real Ethernet / IPv4 MTU (1500 B) minus TCP/IP
+  // headers than the old 1000 B placeholder.
+  uint32_t packetSize = 1400;
+  // Defaults picked to be physically plausible (not toy) while still
+  // running on a laptop within a few seconds:
+  //   * ISL 1 Gbps: order-of-magnitude below reported Starlink optical
+  //     ISLs (~100 Gbps) but high enough that routing, not serialisation,
+  //     dominates latency for typical packets.
+  //   * Access 1 Gbps: sized to avoid being the default bottleneck; real
+  //     Starlink downlinks are typically 100-500 Mbps per user beam.
+  //   * Queue 1000p: larger than the old 100p default so TCP at Gbps
+  //     rates has enough BDP headroom to avoid pathological tail-drops.
+  // Override via --rate / --accessRate / --queueSize.
+  std::string rate = "1Gbps";
+  std::string accessRate = "1Gbps";
+  std::string queueSize = "1000p";
   bool enableAnim = true;
-  std::string flowPatternStr = "random";
+  // Default to gateway<->gateway pairs. Random sat<->sat user flows don't
+  // correspond to how Starlink carries user traffic (bent-pipe to gateway,
+  // or ISL to a gateway footprint) and produce misleading end-to-end paths.
+  std::string flowPatternStr = "gateway";
   uint32_t seed = 1;
   double fragmentationFailFrac = 0.0;
 
@@ -723,6 +805,12 @@ int main(int argc, char* argv[])
   std::cout << "Schema version: " << SCHEMA_VERSION << "\n";
   std::cout << "Frozen-time snapshot: true (no topology evolution "
                "during the run)\n";
+  std::cout << "NOTE: link rates / queues are scenario parameters; they do "
+               "NOT reflect real Starlink hardware. Built-in gateways from "
+               "the generator are DEMO placeholders unless --gateways_csv "
+               "was used. Edge delay_ms is one-way vacuum propagation; "
+               "user-perceived latency also includes queueing, scheduling, "
+               "gateway/PoP hops, and internet transit.\n";
   std::cout << "Nodes: " << N << " (active=" << active << ")\n";
   std::cout << "Edges: " << edges.size() << "\n";
   std::cout << "Components: " << comps.size()
@@ -804,8 +892,21 @@ int main(int argc, char* argv[])
     if (m > 65535.0) m = 65535.0;
     return static_cast<uint16_t>(m);
   };
-  for (const auto& e : edges)
+
+  // Per-device byte counters, indexed by install order. Each edge installs
+  // exactly two devices (one per endpoint), so edge i owns indices 2i and
+  // 2i+1. We attach a PhyTxEnd trace that accumulates the on-wire byte
+  // count; this is the authoritative measurement of link load (it includes
+  // TCP retransmissions and any control traffic GlobalRouter emits).
+  // Shared state lives in heap-allocated vectors so the trace lambdas can
+  // capture by pointer without lifetime concerns.
+  auto devTxBytes = std::make_shared<std::vector<uint64_t>>();
+  auto devEdgeIdx = std::make_shared<std::vector<uint32_t>>();
+  auto devSide    = std::make_shared<std::vector<uint8_t>>();
+
+  for (size_t ei = 0; ei < edges.size(); ++ei)
   {
+    const auto& e = edges[ei];
     PointToPointHelper p2p;
     std::string thisRate = (e.kind == "access") ? accessRate : rate;
     p2p.SetDeviceAttribute("DataRate", StringValue(thisRate));
@@ -827,6 +928,23 @@ int main(int argc, char* argv[])
       Ptr<Ipv4> ipv4 = ifs.Get(side).first;
       uint32_t iface = ifs.Get(side).second;
       if (ipv4) ipv4->SetMetric(iface, metric);
+    }
+
+    // Attach the PhyTxEnd trace on each device. Callback updates the
+    // corresponding counter by the on-wire packet size.
+    for (uint32_t side = 0; side < 2; ++side)
+    {
+      uint32_t devIndex = static_cast<uint32_t>(devTxBytes->size());
+      devTxBytes->push_back(0);
+      devEdgeIdx->push_back(static_cast<uint32_t>(ei));
+      devSide->push_back(static_cast<uint8_t>(side));
+      Ptr<NetDevice> nd = devs.Get(side);
+      // PointToPointNetDevice exposes a "PhyTxEnd" trace source that fires
+      // when the last bit of a packet has left the device — the right
+      // moment to count on-wire bytes.
+      nd->TraceConnectWithoutContext(
+          "PhyTxEnd",
+          MakeBoundCallback(&AccumDevTxBytes, devTxBytes.get(), devIndex));
     }
 
     if (e.kind == "access") ++linksAccess; else ++linksISL;
@@ -1045,12 +1163,11 @@ int main(int argc, char* argv[])
   double aggTxLoadMbps = (totalTxBytes * 8.0) / activeDuration / 1e6;
   double meanDelayMs = sumRxPkts ? (sumDelaySec / sumRxPkts) * 1000.0 : 0.0;
 
-  // Aggregate "utilization" here is a coarse, network-wide loading indicator
-  // (aggregate Tx load / total installed capacity). It is NOT per-link
-  // utilization and cannot reveal bottlenecks on individual hops — a
-  // congested link can sit next to many idle links and still produce a low
-  // aggregate number. Tx load is the right numerator here because TCP
-  // BulkSend has no well-defined "offered rate".
+  // Aggregate "installed-capacity utilization" is aggTxLoad / totalCapacity.
+  // It is deliberately NOT called "utilization" because it cannot reveal
+  // bottlenecks on individual hops — a saturated link can sit next to many
+  // idle links and still produce a low aggregate number. Tx load is the
+  // right numerator here because TCP BulkSend has no "offered rate".
   auto parseRateMbps = [](const std::string& r) -> double {
     double v = 0; std::string u; std::istringstream ss(r);
     ss >> v >> u;
@@ -1063,17 +1180,103 @@ int main(int argc, char* argv[])
   double islMbps = parseRateMbps(rate);
   double accessMbps = parseRateMbps(accessRate);
   double totalCapacityMbps = linksISL * islMbps + linksAccess * accessMbps;
-  double utilization = totalCapacityMbps > 0.0
+  double aggCapUtil = totalCapacityMbps > 0.0
       ? aggTxLoadMbps / totalCapacityMbps * 100.0 : 0.0;
+
+  // Per-link utilization: measured directly from PhyTxEnd traces attached
+  // during link install. devTxBytes[devIdx] is the authoritative on-wire
+  // byte count for each device; we aggregate per-edge by summing both
+  // directions (edges are full duplex and P2P, so per-edge tx = sum of
+  // both endpoints' outgoing bytes / 2 for symmetric reporting, but we
+  // report each direction's utilization separately via max/mean).
+  double maxLinkUtilPct = 0.0;
+  double sumLinkUtilPct = 0.0;
+  uint32_t utilSamples = 0;
+  for (size_t di = 0; di < devTxBytes->size(); ++di)
+  {
+    uint32_t ei = (*devEdgeIdx)[di];
+    if (ei >= edges.size()) continue;
+    const auto& e = edges[ei];
+    double rateMbps = (e.kind == "access") ? accessMbps : islMbps;
+    if (rateMbps <= 0.0) continue;
+    double bits = static_cast<double>((*devTxBytes)[di]) * 8.0;
+    double utilPct = (bits / activeDuration) / 1e6 / rateMbps * 100.0;
+    if (utilPct > maxLinkUtilPct) maxLinkUtilPct = utilPct;
+    sumLinkUtilPct += utilPct;
+    ++utilSamples;
+  }
+  double meanLinkUtilPct = utilSamples ? sumLinkUtilPct / utilSamples : 0.0;
+
+  // Secondary: path-summed upper bound. Useful cross-check — if the PhyTx
+  // measurement and this estimate diverge wildly for the max link, a flow
+  // probably hit a retransmission storm or a router dropped on arrival.
+  struct EdgeKey {
+    uint32_t a, b;
+    bool operator<(const EdgeKey& o) const {
+      if (a != o.a) return a < o.a;
+      return b < o.b;
+    }
+  };
+  std::map<EdgeKey, double> pathSumBitsPerEdge;
+  std::map<EdgeKey, std::string> kindPerEdge;
+  for (const auto& e : edges) {
+    EdgeKey k{std::min(e.u, e.v), std::max(e.u, e.v)};
+    kindPerEdge[k] = e.kind;
+    pathSumBitsPerEdge[k] += 0.0;
+  }
+  for (const auto& r : perFlowRows) {
+    DijkstraResult dj = DijkstraDelay(adjW, r.srcNode, r.dstNode);
+    if (std::isinf(dj.delayMs) || dj.delayMs < 0) continue;
+    std::vector<uint32_t> path;
+    {
+      std::vector<double> dist(N, std::numeric_limits<double>::infinity());
+      std::vector<int64_t> prev(N, -1);
+      using Item = std::pair<double, uint32_t>;
+      std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+      dist[r.srcNode] = 0.0; pq.push({0.0, r.srcNode});
+      while (!pq.empty()) {
+        auto [d, u] = pq.top(); pq.pop();
+        if (d > dist[u]) continue;
+        if (u == r.dstNode) break;
+        for (const auto& [v, w] : adjW[u]) {
+          double nd = d + w;
+          if (nd < dist[v]) { dist[v] = nd; prev[v] = (int64_t)u; pq.push({nd, v}); }
+        }
+      }
+      if (std::isinf(dist[r.dstNode])) continue;
+      for (int64_t u = (int64_t)r.dstNode; u != -1; u = prev[u]) path.push_back((uint32_t)u);
+      std::reverse(path.begin(), path.end());
+    }
+    double bits = static_cast<double>(r.txBytes) * 8.0;
+    for (size_t i = 1; i < path.size(); ++i) {
+      EdgeKey k{std::min(path[i-1], path[i]), std::max(path[i-1], path[i])};
+      auto it = pathSumBitsPerEdge.find(k);
+      if (it != pathSumBitsPerEdge.end()) it->second += bits;
+    }
+  }
+  double maxPathSumUtilPct = 0.0;
+  for (const auto& [k, bits] : pathSumBitsPerEdge) {
+    double rateMbps = (kindPerEdge[k] == "access") ? accessMbps : islMbps;
+    if (rateMbps <= 0.0) continue;
+    double utilPct = (bits / activeDuration) / 1e6 / rateMbps * 100.0;
+    if (utilPct > maxPathSumUtilPct) maxPathSumUtilPct = utilPct;
+  }
 
   std::cout << "\n=== OVERALL RESULTS ===\n";
   std::cout << "Tx load:       " << aggTxLoadMbps << " Mbps\n";
   std::cout << "Goodput:       " << aggGoodputMbps << " Mbps\n";
-  std::cout << "Utilization:   " << utilization << " % "
-            << "of " << totalCapacityMbps << " Mbps installed capacity "
-            << "(aggregate Tx load / total capacity; not per-link)\n";
+  std::cout << "Installed cap: " << totalCapacityMbps
+            << " Mbps (sum of per-direction link rates)\n";
+  std::cout << "Agg cap util:  " << aggCapUtil
+            << " %  (aggTxLoad / installedCap; coarse)\n";
+  std::cout << "Per-link util: max=" << maxLinkUtilPct << "%, "
+            << "mean=" << meanLinkUtilPct
+            << "% (measured from PhyTxEnd over " << utilSamples
+            << " devices)\n";
+  std::cout << "Path-sum util: max=" << maxPathSumUtilPct
+            << "% (analytical upper bound; should be >= measured)\n";
   std::cout << "Mean delay:    " << meanDelayMs << " ms\n";
-  std::cout << "Retrans:       (see per-flow tcpRetransOverhead)\n";
+  std::cout << "Retrans:       (see per-flow tcp_retrans_overhead_percent)\n";
 
   // Write per-flow CSV atomically.
   std::string tmpOut = perFlowOut + ".tmp";
@@ -1081,11 +1284,28 @@ int main(int argc, char* argv[])
     std::ofstream csv(tmpOut);
     if (!csv.is_open()) NS_FATAL_ERROR("Cannot write " << tmpOut);
     csv << "schema_version=" << SCHEMA_VERSION << "\n";
+    // Column notes:
+    //  * goodput_mbps:            rxBytes / activeDuration (bits/s -> Mbps).
+    //  * tcp_byte_efficiency_percent: rxBytes/txBytes as a coarse transfer
+    //    efficiency indicator. NOT an application-layer loss probability;
+    //    TCP retransmits transparently at the source so any TCP flow that
+    //    completes normally will reach ~100% here even if many segments
+    //    were retransmitted. The separate tcp_retrans_overhead_percent
+    //    column surfaces retransmission overhead.
+    //  * delivery_ratio_percent:  deprecated alias for the same value,
+    //    retained for back-compat with schema 2.0.0 consumers.
+    //  * hop_count_on_min_delay_path: number of hops counted along the
+    //    delay-weighted Dijkstra route that ns-3 actually uses.
+    //    hop_count_unweighted is a deprecated alias.
+    //  * shortest_delay_ms:       sum of edge propagation delays along
+    //    the min-delay path; serialisation/queueing NOT included.
     csv << "flow_index,src_node,dst_node,port,transport,"
-           "goodput_mbps,delivery_ratio_percent,"
+           "goodput_mbps,"
+           "tcp_byte_efficiency_percent,delivery_ratio_percent,"
            "tcp_retrans_overhead_percent,"
            "mean_delay_ms,mean_jitter_ms,"
-           "hop_count_unweighted,shortest_delay_ms,"
+           "hop_count_on_min_delay_path,hop_count_unweighted,"
+           "shortest_delay_ms,"
            "tx_packets,rx_packets,lost_packets,tx_bytes,rx_bytes\n";
     auto nanToStr = [](double v) {
       if (std::isnan(v)) return std::string("NaN");
@@ -1097,9 +1317,12 @@ int main(int argc, char* argv[])
           << r.port << ",tcp,"
           << r.goodputMbps << ","
           << r.deliveryRatioPercent << ","
+          << r.deliveryRatioPercent << ","  // deprecated alias column
           << nanToStr(r.tcpRetransOverheadPercent) << ","
           << r.meanDelayMs << "," << r.meanJitterMs << ","
-          << r.hopCountUnweighted << "," << r.shortestDelayMs << ","
+          << r.hopCountUnweighted << ","
+          << r.hopCountUnweighted << ","    // deprecated alias column
+          << r.shortestDelayMs << ","
           << r.txPackets << "," << r.rxPackets << "," << r.lostPackets << ","
           << r.txBytes << "," << r.rxBytes << "\n";
     }
@@ -1129,7 +1352,17 @@ int main(int argc, char* argv[])
       j << "  \"installed_capacity_mbps\": " << totalCapacityMbps << ",\n";
       j << "  \"aggregate_goodput_mbps\": " << aggGoodputMbps << ",\n";
       j << "  \"aggregate_tx_load_mbps\": " << aggTxLoadMbps << ",\n";
-      j << "  \"utilization_percent\": " << utilization << "\n";
+      j << "  \"aggregate_cap_utilization_percent\": " << aggCapUtil << ",\n";
+      j << "  \"per_link_util_max_percent\": " << maxLinkUtilPct << ",\n";
+      j << "  \"per_link_util_mean_percent\": " << meanLinkUtilPct << ",\n";
+      j << "  \"per_link_util_samples\": " << utilSamples << ",\n";
+      j << "  \"per_link_util_source\": \"PhyTxEnd_trace\",\n";
+      j << "  \"per_link_util_pathsum_upperbound_max_percent\": "
+        << maxPathSumUtilPct << ",\n";
+      j << "  \"utilization_metric_note\": \""
+        << "aggregate_cap_utilization is aggTxLoad / sum(installed link rates); "
+        << "per_link_util is measured per-device from PhyTxEnd traces; "
+        << "pathsum_upperbound is an analytical upper bound for cross-check.\"\n";
       j << "}\n";
     }
   }

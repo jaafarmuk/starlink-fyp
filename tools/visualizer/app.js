@@ -9,14 +9,20 @@
 // estimated analytically from the UI inputs — this tool is for teaching /
 // what-if exploration, not a replacement for the FlowMonitor run.
 //
+// IMPORTANT SEMANTICS:
+//   * The animated "drop" model is a per-link Bernoulli loss applied to a
+//     single packet; there is NO retransmission, so delivery percentages
+//     here are packet-level, NOT TCP-level. Real TCP retransmits.
+//   * Offered load can be set explicitly; when left at 0 it falls back to
+//     assuming a saturating TCP flow at the bottleneck rate, in which case
+//     the bottleneck hop will always show rho ≈ 1.
+//   * "Propagation" is one-way speed-of-light; it is not ping latency.
+//
 // Controls:
 //   - source / dest: pick any node (satellite or gateway)
 //   - packet size + link rate + queue size + offered load -> per-hop cost
 //   - "Send packet" animates a single packet hop-by-hop
 //   - "Steady load" keeps injecting at the configured packets-per-second
-//
-// A single per-link loss model is applied (configurable). Packets that
-// are "dropped" do not reach the destination — they are shown fading red.
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -57,7 +63,9 @@ const ui = {
   linkRate: document.getElementById('link-rate'),
   accessRate: document.getElementById('access-rate'),
   queueSize: document.getElementById('queue-size'),
+  offeredLoad: document.getElementById('offered-load'),
   lossProb: document.getElementById('loss-probability'),
+  retransmit: document.getElementById('retransmit'),
   launch: document.getElementById('launch'),
   launchBurst: document.getElementById('launch-burst'),
   steady: document.getElementById('steady'),
@@ -80,15 +88,42 @@ const ui = {
 // CSV parsing (tolerant to optional schema_version preamble)
 // ---------------------------------------------------------------------------
 
+// RFC-4180-lite split: handles double-quoted fields containing commas and
+// escaped "" inside quotes. Falls back to a plain comma split when no
+// quotes are present so there is no behavior change for the common case.
+function splitCsvLine(line) {
+  if (line.indexOf('"') < 0) return line.split(',');
+  const out = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; ++i) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === '"') {
+        if (i + 1 < line.length && line[i + 1] === '"') { cur += '"'; ++i; }
+        else inQuote = false;
+      } else {
+        cur += c;
+      }
+    } else {
+      if (c === ',') { out.push(cur); cur = ''; }
+      else if (c === '"' && cur === '') inQuote = true;
+      else cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter(l => l.length > 0);
   if (!lines.length) return [];
   let start = 0;
   if (lines[0].startsWith('schema_version=')) start = 1;
-  const header = lines[start].split(',');
+  const header = splitCsvLine(lines[start]);
   const out = [];
   for (let i = start + 1; i < lines.length; ++i) {
-    const cells = lines[i].split(',');
+    const cells = splitCsvLine(lines[i]);
     const row = {};
     for (let j = 0; j < header.length; ++j) row[header[j]] = cells[j];
     out.push(row);
@@ -379,12 +414,19 @@ function dijkstra(src, dst) {
 // ---------------------------------------------------------------------------
 
 function readParams() {
+  // offeredMbps = 0 means "saturating": use the path bottleneck as the
+  // offered rate (the classic BulkSend TCP assumption). Any positive value
+  // is used as an explicit Poisson-ish arrival rate and will produce
+  // realistic sub-saturation rho estimates on each hop.
+  const offeredRaw = ui.offeredLoad ? Number(ui.offeredLoad.value) : 0;
   return {
     packetBytes: Math.max(1, Number(ui.packetSize.value)),
     islMbps: Math.max(0.001, Number(ui.linkRate.value)),
     accessMbps: Math.max(0.001, Number(ui.accessRate.value)),
     queuePkts: Math.max(1, Number(ui.queueSize.value)),
     lossProb: Math.max(0, Math.min(1, Number(ui.lossProb.value))),
+    offeredMbps: Math.max(0, isFinite(offeredRaw) ? offeredRaw : 0),
+    retransmitOnLoss: ui.retransmit ? !!ui.retransmit.checked : false,
   };
 }
 
@@ -420,8 +462,10 @@ function hopCostsForPath(path, edgeIdxPath, params) {
   let totalSerMs = 0.0;
   let totalQueueMs = 0.0;
 
-  // TCP BulkSend saturates the path: the achievable rate is bounded by the
-  // slowest link along the path (usually the access link, if any).
+  // Bottleneck along the path = min(rate) over edges. Relevant whether the
+  // user explicitly set offeredMbps (we cap it at the bottleneck since no
+  // higher sustained rate is physically deliverable on this path) or left
+  // it at 0 (classic TCP BulkSend assumption).
   let bottleneckBps = Infinity;
   for (let i = 0; i < edgeIdxPath.length; ++i) {
     const e = state.edges[edgeIdxPath[i]];
@@ -430,7 +474,14 @@ function hopCostsForPath(path, edgeIdxPath, params) {
   }
   if (!isFinite(bottleneckBps)) bottleneckBps = params.islMbps * 1e6;
 
-  const offeredBps = bottleneckBps;
+  // offeredBps: user-chosen rate if > 0, otherwise bottleneck (saturating).
+  // Cap at bottleneck because a higher sustained rate cannot survive the
+  // narrow part of the pipe — it would just build unbounded queueing.
+  const userBps = params.offeredMbps > 0 ? params.offeredMbps * 1e6 : 0;
+  const offeredBps = userBps > 0
+    ? Math.min(userBps, bottleneckBps)
+    : bottleneckBps;
+  const saturating = userBps <= 0;
 
   for (let i = 0; i < edgeIdxPath.length; ++i) {
     const e = state.edges[edgeIdxPath[i]];
@@ -439,8 +490,9 @@ function hopCostsForPath(path, edgeIdxPath, params) {
     const rateMbps = isAccess ? params.accessMbps : params.islMbps;
     const rateBps = rateMbps * 1e6;
     const serMs = (params.packetBytes * 8.0) / rateBps * 1000.0;
-    // Every hop on a TCP saturating flow sees the same bottleneck offered
-    // rate, so upstream links below the bottleneck have rho < 1 (correctly).
+    // Upstream links with higher capacity see rho < 1. The bottleneck sees
+    // rho ≈ 1 ONLY when the user is in saturating mode (userBps <= 0) —
+    // that is an explicit choice the UI surfaces, not a hidden assumption.
     const rho = Math.min(0.999, offeredBps / rateBps);
     const queueMs = estimateQueuingMs(rho, serMs, params.queuePkts);
     const propMs = e.delayMs;
@@ -461,32 +513,35 @@ function hopCostsForPath(path, edgeIdxPath, params) {
       rateMbps,
     });
   }
-  return { rows, totalMs, totalPropMs, totalSerMs, totalQueueMs };
+  return {
+    rows, totalMs, totalPropMs, totalSerMs, totalQueueMs,
+    offeredBps, bottleneckBps, saturating,
+  };
 }
 
 function renderFlowSummary(dijkstraResult) {
   const params = readParams();
   const costs = hopCostsForPath(dijkstraResult.path, dijkstraResult.edgeIdxPath, params);
   const hops = dijkstraResult.path.length - 1;
-  // Bottleneck along the path: min(rate) over edges. TCP BulkSend saturates
-  // this; we report it as the effective offered rate.
-  let bottleneckMbps = Infinity;
-  for (const ei of dijkstraResult.edgeIdxPath) {
-    const e = state.edges[ei];
-    const r = e.kind === 'access' ? params.accessMbps : params.islMbps;
-    if (r < bottleneckMbps) bottleneckMbps = r;
-  }
-  if (!isFinite(bottleneckMbps)) bottleneckMbps = params.islMbps;
-  const offeredMbps = bottleneckMbps;
+  const bottleneckMbps = costs.bottleneckBps / 1e6;
+  const offeredMbps = costs.offeredBps / 1e6;
+  const offeredLabel = costs.saturating
+    ? `${offeredMbps.toFixed(3)} Mbps (saturating; = bottleneck)`
+    : `${offeredMbps.toFixed(3)} Mbps (user-set; bottleneck ${bottleneckMbps.toFixed(3)} Mbps)`;
 
   ui.flowSummary.innerHTML = `
-    <div class="kv"><span>Transport</span><span>TCP</span></div>
+    <div class="kv"><span>Transport label</span><span>packet-level anim</span></div>
     <div class="kv"><span>Hops</span><span>${hops}</span></div>
-    <div class="kv"><span>Propagation</span><span>${costs.totalPropMs.toFixed(2)} ms</span></div>
+    <div class="kv"><span>One-way propagation</span><span>${costs.totalPropMs.toFixed(2)} ms</span></div>
     <div class="kv"><span>Serialization</span><span>${costs.totalSerMs.toFixed(3)} ms</span></div>
-    <div class="kv"><span>Queuing (est)</span><span>${costs.totalQueueMs.toFixed(3)} ms</span></div>
-    <div class="kv"><span>Total one-way</span><span><b>${costs.totalMs.toFixed(2)} ms</b></span></div>
-    <div class="kv"><span>Offered rate</span><span>${offeredMbps.toFixed(3)} Mbps (TCP saturating)</span></div>
+    <div class="kv"><span>Queuing (M/M/1 est)</span><span>${costs.totalQueueMs.toFixed(3)} ms</span></div>
+    <div class="kv"><span>Total one-way (est)</span><span><b>${costs.totalMs.toFixed(2)} ms</b></span></div>
+    <div class="kv"><span>Offered rate</span><span>${offeredLabel}</span></div>
+    <div class="muted" style="margin-top:4px">
+      Delay shown is one-way vacuum propagation plus analytical serialisation
+      and M/M/1 queueing — NOT a ping. Per-link loss is Bernoulli with no
+      TCP retransmission unless the retransmit toggle is on.
+    </div>
   `;
 
   ui.hoplist.innerHTML = costs.rows.map(r => `
@@ -516,13 +571,40 @@ function launchPacket() {
   const costs = hopCostsForPath(result.path, result.edgeIdxPath, params);
   const hops = result.path.length - 1;
 
-  // Evaluate per-link loss
+  // Evaluate per-link loss. With retransmitOnLoss on, we model a simple
+  // stop-and-wait TCP-like behaviour:
+  //   * On each attempt, independently sample per-hop Bernoulli loss.
+  //   * If any hop drops, schedule a retransmission after one path RTT
+  //     (approximated as 2x the path's total estimated one-way time).
+  //   * The packet eventually delivers; the realTotalMs reported below
+  //     accumulates the retry wait time, so mean latency reflects retries.
+  //   * MAX_TCP_RETRIES guards against lossProb = 1 infinite loops.
+  // This is intentionally a teaching model — real TCP uses cumulative
+  // ACKs, cwnd, RTO with RTT estimation and Karn's algorithm, etc.
   let dropIndex = -1;
+  let tcpAttempts = 1;
+  let accumulatedRetxWaitMs = 0;
+  const MAX_TCP_RETRIES = 32;
   for (let i = 0; i < hops; ++i) {
     if (Math.random() < params.lossProb) { dropIndex = i; break; }
   }
+  let wasRetransmitted = false;
+  if (dropIndex !== -1 && params.retransmitOnLoss) {
+    while (dropIndex !== -1 && tcpAttempts < MAX_TCP_RETRIES) {
+      // One-RTT retransmission wait: approximate RTT as 2x total one-way.
+      accumulatedRetxWaitMs += 2.0 * costs.totalMs;
+      dropIndex = -1;
+      tcpAttempts += 1;
+      for (let i = 0; i < hops; ++i) {
+        if (Math.random() < params.lossProb) { dropIndex = i; break; }
+      }
+      wasRetransmitted = true;
+    }
+  }
 
-  const color = dropIndex === -1 ? 0x4ad6ff : 0xff6a6a;
+  const color = dropIndex === -1
+    ? (wasRetransmitted ? 0xffd466 : 0x4ad6ff)
+    : 0xff6a6a;
   const mat = new THREE.MeshBasicMaterial({ color });
   const geo = new THREE.SphereGeometry(0.09, 10, 10);
   const mesh = new THREE.Mesh(geo, mat);
@@ -538,7 +620,10 @@ function launchPacket() {
     hopProgress: 0.0,
     dropIndex,
     startedAt: performance.now(),
-    realTotalMs: costs.totalMs,
+    // Mean-latency accounting: successful delivery includes any TCP
+    // retransmission wait we modelled above.
+    realTotalMs: costs.totalMs + accumulatedRetxWaitMs,
+    tcpAttempts,
     color,
   });
 
@@ -621,9 +706,13 @@ function updateAggregate() {
   ui.metrics.innerHTML = `
     <div class="kv"><span>Sent</span><span>${sent}</span></div>
     <div class="kv"><span>Delivered</span><span>${delivered}</span></div>
-    <div class="kv"><span>Lost</span><span>${lost}</span></div>
-    <div class="kv"><span>Delivery</span><span>${deliveryPct.toFixed(2)} %</span></div>
-    <div class="kv"><span>Mean E2E</span><span>${meanMs.toFixed(2)} ms</span></div>
+    <div class="kv"><span>Lost (no retx)</span><span>${lost}</span></div>
+    <div class="kv"><span>Packet delivery</span><span>${deliveryPct.toFixed(2)} %</span></div>
+    <div class="kv"><span>Mean E2E (est)</span><span>${meanMs.toFixed(2)} ms</span></div>
+    <div class="muted" style="margin-top:4px">
+      Packet-level delivery, not TCP byte delivery. A real TCP flow would
+      retransmit all lost packets and hit 100% delivery under moderate loss.
+    </div>
   `;
 }
 
@@ -696,7 +785,9 @@ function wireUi() {
   });
 
   for (const el of [ui.packetSize, ui.linkRate, ui.accessRate,
-                    ui.queueSize, ui.lossProb]) {
+                    ui.queueSize, ui.offeredLoad, ui.lossProb,
+                    ui.retransmit]) {
+    if (!el) continue;
     el.addEventListener('change', refreshPath);
     el.addEventListener('input', refreshPath);
   }
@@ -782,14 +873,19 @@ async function main() {
         'new generator for accurate geodetic placement.';
       ui.metaInfo.parentNode.insertBefore(msg, ui.metaInfo);
     }
-    state.edges = edgesRows.map(r => ({
-      u: Number(r.u),
-      v: Number(r.v),
-      distanceKm: Number(r.distance_km),
-      delayMs: Number(r.delay_ms),
-      kind: r.kind || 'unknown',
-      shellId: Number(r.shell_id ?? -1),
-    }));
+    state.edges = edgesRows.map(r => {
+      // Schema 2.1.0 column is prop_delay_ms (one-way vacuum propagation).
+      // Schema 2.0.0 wrote this as delay_ms, kept as deprecated alias.
+      const propStr = r.prop_delay_ms ?? r.delay_ms;
+      return {
+        u: Number(r.u),
+        v: Number(r.v),
+        distanceKm: Number(r.distance_km),
+        delayMs: Number(propStr),
+        kind: r.kind || 'unknown',
+        shellId: Number(r.shell_id ?? -1),
+      };
+    });
 
     buildGraph();
     initScene();

@@ -112,15 +112,27 @@
           <input id="queue-size" type="number" min="1" max="100000" value="100" />
         </div>
       </div>
-      <label>Per-link loss probability</label>
       <div class="row">
         <div>
+          <label>Offered load (Mbps, 0 = saturating)</label>
+          <input id="offered-load" type="number" min="0" max="100000" step="0.1" value="0" />
+        </div>
+        <div>
+          <label>Per-link loss probability</label>
           <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0.005" />
-          <div class="muted">used only for the packet-animation drop demo</div>
         </div>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+        <input id="retransmit" type="checkbox" />
+        TCP-style retransmit on loss (animation only)
+      </label>
       <div class="muted" style="margin-top:6px">
-        Transport: TCP (BulkSend saturating the path bottleneck).
+        Offered load = 0 uses the path bottleneck as the offered rate, which
+        forces ρ≈1 on the bottleneck hop. Set a positive value to see
+        sub-saturation behaviour. The per-link loss drop is Bernoulli and,
+        by default, the packet is simply lost — toggle retransmit above
+        for a simplified TCP-like behaviour. This is a teaching
+        animation, not a TCP stack.
       </div>
     </div>
 
@@ -193,9 +205,15 @@
       <h2>Notes</h2>
       <div class="muted">
         Positions are the ECEF projection from the snapshot (a frozen-time
-        view). Propagation delays match the generator's output; serialization
+        view). Propagation delays match the generator's output and are
+        one-way vacuum speed-of-light — not ping latency. Serialization
         and queueing are <em>derived here</em> from your packet size, link
-        rate and offered load — they are not FlowMonitor truth.
+        rate, and offered load; they are not FlowMonitor truth.
+        <br/><br/>
+        Ground stations labelled <code>GW-DEMO-*</code> are built-in demo
+        placeholders (city centroids), NOT real Starlink gateway sites.
+        For a physically meaningful study, regenerate with
+        <code>--gateways_csv</code> pointing at an authoritative list.
         For real ns-3 numbers run <code>tools/run_ns3_snapshot.sh</code>.
       </div>
     </div>

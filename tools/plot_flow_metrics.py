@@ -17,18 +17,23 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-SUPPORTED_SCHEMAS = {"1", "2.0.0"}
+SUPPORTED_SCHEMAS = {"1", "2.0.0", "2.1.0"}
 
-# Column mapping between v1 (pre-review) and v2 (current) so the plotter can
-# consume either file without regeneration. Entries on the left are the names
-# the plotter uses internally; the right side is what we look for in the CSV.
+# Column mapping across schemas so the plotter can consume any supported
+# version without regeneration. Keys on the left are the names the plotter
+# uses internally; the lists on the right are candidate source columns in
+# the CSV, checked in order.
 CANONICAL_COLUMNS = {
     "throughput": ["goodput_mbps", "throughput_mbps"],
     "mean_delay_ms": ["mean_delay_ms"],
     "mean_jitter_ms": ["mean_jitter_ms"],
     "tcp_retrans_overhead_percent": ["tcp_retrans_overhead_percent"],
-    "delivery_ratio_percent": ["delivery_ratio_percent"],
-    "hop_count": ["hop_count_unweighted", "hop_count"],
+    # 2.1.0 renamed delivery_ratio -> tcp_byte_efficiency; we prefer the
+    # new name but accept the old one.
+    "tcp_byte_efficiency_percent": [
+        "tcp_byte_efficiency_percent", "delivery_ratio_percent"],
+    "hop_count": [
+        "hop_count_on_min_delay_path", "hop_count_unweighted", "hop_count"],
     "shortest_delay_ms": ["shortest_delay_ms"],
     "src_node": ["src_node"],
     "dst_node": ["dst_node"],
@@ -160,9 +165,9 @@ def main():
     plot_bar(df, "tcp_retrans_overhead_percent",
              "Per-flow TCP retransmission overhead", "%",
              os.path.join(args.out_dir, "tcp_retrans_overhead_per_flow.png"))
-    plot_bar(df, "delivery_ratio_percent",
-             "Per-flow byte delivery ratio", "%",
-             os.path.join(args.out_dir, "delivery_ratio_per_flow.png"))
+    plot_bar(df, "tcp_byte_efficiency_percent",
+             "Per-flow TCP byte transfer efficiency (rxBytes/txBytes)", "%",
+             os.path.join(args.out_dir, "tcp_byte_efficiency_per_flow.png"))
 
     plot_cdf(df, "throughput",
              "Goodput CDF", "Mbps",

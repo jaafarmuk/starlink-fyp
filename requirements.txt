@@ -1,4 +1,7 @@
-matplotlib
-numpy
-pandas
-sgp4
+# Python dependencies for snapshot generation and plotting.
+# ns-3 is a separate simulator and is not installed through pip.
+
+numpy>=1.26
+pandas>=2.0
+sgp4>=2.23
+matplotlib>=3.8
