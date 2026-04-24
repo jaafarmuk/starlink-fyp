@@ -8,7 +8,10 @@
       "Bash(python tools/tle_to_snapshot.py --tle datasets/starlink.tle --n 60 --edges_out results/snapshot_edges.csv --nodes_out results/snapshot_nodes.csv --stats_out results/topology_stats.csv --meta_out results/snapshot_meta.json)",
       "Bash(python tools/tle_to_snapshot.py --tle datasets/starlink.tle --n 200 --sample random --seed 1 --max_km 5500 --no_seam_avoidance --edges_out results/snapshot_edges.csv --nodes_out results/snapshot_nodes.csv --stats_out results/topology_stats.csv --meta_out results/snapshot_meta.json)",
       "Bash(python tools/tle_to_snapshot.py --tle datasets/starlink.tle --n 500 --sample head --max_km 5500 --inc_tol_deg 2 --alt_tol_km 80 --raan_tol_deg 8 --edges_out results/snapshot_edges.csv --nodes_out results/snapshot_nodes.csv --stats_out results/topology_stats.csv --meta_out results/snapshot_meta.json)",
-      "Bash(python tools/tle_to_snapshot.py --tle datasets/starlink.tle --n 200 --sample head --max_km 5500 --inc_tol_deg 2 --alt_tol_km 80 --raan_tol_deg 8 --edges_out results/snapshot_edges.csv --nodes_out results/snapshot_nodes.csv --stats_out results/topology_stats.csv --meta_out results/snapshot_meta.json)"
+      "Bash(python tools/tle_to_snapshot.py --tle datasets/starlink.tle --n 200 --sample head --max_km 5500 --inc_tol_deg 2 --alt_tol_km 80 --raan_tol_deg 8 --edges_out results/snapshot_edges.csv --nodes_out results/snapshot_nodes.csv --stats_out results/topology_stats.csv --meta_out results/snapshot_meta.json)",
+      "Bash(node --check x:/Fyp/starlink-fyp/tools/visualizer/app.js)",
+      "Bash(python -m py_compile x:/Fyp/starlink-fyp/tools/tle_to_snapshot.py)",
+      "Bash(grep -n *)"
     ]
   }
 }

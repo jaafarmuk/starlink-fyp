@@ -344,40 +344,56 @@ def distance_km(r1, r2) -> float:
 # Shell + plane clustering (addresses review items 2, 3, 4, 5, 6)
 # ---------------------------------------------------------------------------
 
+def _cluster_1d_tolerance(values_and_ids: list[tuple[float, int]],
+                          tol: float) -> list[list[int]]:
+    """Sort by value and split into groups whenever two adjacent values differ
+    by more than `tol`. Each group's range is bounded by `tol` x gap count,
+    not by a global centre, so physically similar items near bin boundaries
+    do not split. Non-angular values only (use elsewhere for RAAN, etc.).
+    """
+    if not values_and_ids:
+        return []
+    ordered = sorted(values_and_ids, key=lambda t: t[0])
+    groups: list[list[int]] = [[ordered[0][1]]]
+    prev = ordered[0][0]
+    for v, sid in ordered[1:]:
+        if v - prev <= tol:
+            groups[-1].append(sid)
+        else:
+            groups.append([sid])
+        prev = v
+    return groups
+
+
 def cluster_shells(sats: list[dict],
                    inc_tol_deg: float,
                    alt_tol_km: float) -> dict[int, list[int]]:
     """Group satellites into physical shells by (inclination, altitude).
 
-    A 1-D hybrid clustering: inclination rounded to a bin then altitudes
-    inside each inclination bin grouped by contiguous tolerance. Altitude
-    is not angular, so no wrap-around handling is needed here.
+    Tolerance-based 1-D clustering on each axis so satellites that differ by
+    less than tol on both inclination and altitude stay together. Rounding
+    into fixed bins is intentionally avoided: two satellites that straddle
+    a bin boundary but are physically within `inc_tol_deg` of each other
+    would otherwise split into different shells.
     """
     if not sats:
         return {}
 
-    inc_bins: dict[int, list[int]] = defaultdict(list)
-    for s in sats:
-        key = int(round(s["i_deg"] / max(inc_tol_deg, 0.1)))
-        inc_bins[key].append(s["id"])
+    inc_groups = _cluster_1d_tolerance(
+        [(s["i_deg"], s["id"]) for s in sats],
+        max(inc_tol_deg, 1e-6),
+    )
 
     shells: dict[int, list[int]] = {}
     shell_id = 0
-    for _, ids in sorted(inc_bins.items()):
-        alts = sorted(((sats[i]["alt_km"], i) for i in ids))
-        current: list[int] = [alts[0][1]]
-        cur_alt = alts[0][0]
-        for alt, sid in alts[1:]:
-            if abs(alt - cur_alt) <= alt_tol_km:
-                current.append(sid)
-                cur_alt = 0.5 * (cur_alt + alt)
-            else:
-                shells[shell_id] = current
-                shell_id += 1
-                current = [sid]
-                cur_alt = alt
-        shells[shell_id] = current
-        shell_id += 1
+    for ids in inc_groups:
+        alt_groups = _cluster_1d_tolerance(
+            [(sats[sid]["alt_km"], sid) for sid in ids],
+            max(alt_tol_km, 1e-6),
+        )
+        for g in alt_groups:
+            shells[shell_id] = g
+            shell_id += 1
     return shells
 
 
@@ -481,6 +497,34 @@ def link_midpoint_subpoint_lat(r1_eci: np.ndarray,
     return abs(lat)
 
 
+def link_min_elevation_deg(r1_eci: np.ndarray,
+                           r2_eci: np.ndarray) -> float:
+    """Minimum local elevation angle along an inter-satellite link, measured
+    from each endpoint's local horizontal plane (the plane orthogonal to the
+    endpoint's geocentric position vector). For ISLs this is a first-order
+    line-of-sight check: if either end sees the other *below* its horizon,
+    the link grazes the Earth/atmosphere. Returns the smaller of the two
+    endpoint elevation angles, in degrees.
+    """
+    r1 = np.asarray(r1_eci, dtype=float)
+    r2 = np.asarray(r2_eci, dtype=float)
+    los = r2 - r1
+    dist = float(np.linalg.norm(los))
+    if dist <= 0.0:
+        return 90.0
+    n1 = float(np.linalg.norm(r1))
+    n2 = float(np.linalg.norm(r2))
+    if n1 <= 0.0 or n2 <= 0.0:
+        return 90.0
+    up1 = r1 / n1
+    up2 = r2 / n2
+    sin_e1 = float(np.dot(los, up1)) / dist
+    sin_e2 = float(np.dot(-los, up2)) / dist
+    sin_e1 = max(-1.0, min(1.0, sin_e1))
+    sin_e2 = max(-1.0, min(1.0, sin_e2))
+    return math.degrees(min(math.asin(sin_e1), math.asin(sin_e2)))
+
+
 def try_add_edge(u_id: int,
                  v_id: int,
                  sats_by_id: dict[int, dict],
@@ -514,6 +558,13 @@ def try_add_edge(u_id: int,
     if policy.apply_seam_avoidance:
         mid_lat = link_midpoint_subpoint_lat(r1, r2, jd, fr)
         if mid_lat > policy.disable_above_abs_lat_deg:
+            return False
+
+    # Reject ISLs whose endpoints see each other below the local horizon
+    # (grazing links with implausibly low elevation angles).
+    if policy.min_elevation_angle_deg > -90.0:
+        min_elev = link_min_elevation_deg(r1, r2)
+        if min_elev < policy.min_elevation_angle_deg:
             return False
 
     delay_ms = (d / C_KM_S) * 1000.0
@@ -606,7 +657,16 @@ def build_access_links(ground_stations: list[dict],
     for gs in ground_stations:
         candidates = []
         gs_ecef = gs["r_ecef"]
-        gs_up = gs_ecef / max(np.linalg.norm(gs_ecef), 1e-9)
+        # Geodetic up on the WGS84 ellipsoid (ENU "up"), NOT geocentric
+        # up. The two differ by a few tenths of a degree at mid-latitudes;
+        # elevation thresholds near horizon depend on the geodetic normal.
+        lat = math.radians(gs["lat_deg"])
+        lon = math.radians(gs["lon_deg"])
+        gs_up = np.array([
+            math.cos(lat) * math.cos(lon),
+            math.cos(lat) * math.sin(lon),
+            math.sin(lat),
+        ], dtype=float)
         for s in sats:
             sat_ecef = s["r_ecef"]
             los = sat_ecef - gs_ecef
@@ -619,9 +679,15 @@ def build_access_links(ground_stations: list[dict],
                 continue
             candidates.append((dist, elev, s["id"]))
 
+        # Sort by distance, then accept the first `max_sats_per_gs` *valid*
+        # candidates — skipping (not slicing) those blocked by the per-sat cap
+        # or existing edges, so later valid sats are still considered.
         candidates.sort(key=lambda x: x[0])
-        for dist, elev, sid in candidates[:max_sats_per_gs]:
-            gs_id = gs["id"]
+        gs_id = gs["id"]
+        added_for_gs = 0
+        for dist, elev, sid in candidates:
+            if added_for_gs >= max_sats_per_gs:
+                break
             if degree[gs_id] >= max_sats_per_gs:
                 break
             if sat_access_degree[sid] >= max_gs_per_sat:
@@ -641,6 +707,7 @@ def build_access_links(ground_stations: list[dict],
             degree[sid] += 1
             sat_access_degree[sid] += 1
             added_pairs.append(pair)
+            added_for_gs += 1
     return added_pairs
 
 

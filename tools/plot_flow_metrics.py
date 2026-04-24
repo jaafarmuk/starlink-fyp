@@ -26,15 +26,13 @@ CANONICAL_COLUMNS = {
     "throughput": ["goodput_mbps", "throughput_mbps"],
     "mean_delay_ms": ["mean_delay_ms"],
     "mean_jitter_ms": ["mean_jitter_ms"],
-    "loss_percent": ["packet_loss_percent", "udp_loss_percent", "loss_rate_percent"],
+    "tcp_retrans_overhead_percent": ["tcp_retrans_overhead_percent"],
     "delivery_ratio_percent": ["delivery_ratio_percent"],
-    "offered_load_mbps": ["offered_load_mbps"],
     "hop_count": ["hop_count_unweighted", "hop_count"],
     "shortest_delay_ms": ["shortest_delay_ms"],
     "src_node": ["src_node"],
     "dst_node": ["dst_node"],
     "flow_index": ["flow_index"],
-    "transport": ["transport"],
 }
 
 
@@ -159,9 +157,9 @@ def main():
     plot_bar(df, "mean_jitter_ms",
              "Per-flow mean jitter", "ms",
              os.path.join(args.out_dir, "jitter_per_flow.png"))
-    plot_bar(df, "loss_percent",
-             "Per-flow UDP packet loss", "%",
-             os.path.join(args.out_dir, "loss_rate_per_flow.png"))
+    plot_bar(df, "tcp_retrans_overhead_percent",
+             "Per-flow TCP retransmission overhead", "%",
+             os.path.join(args.out_dir, "tcp_retrans_overhead_per_flow.png"))
     plot_bar(df, "delivery_ratio_percent",
              "Per-flow byte delivery ratio", "%",
              os.path.join(args.out_dir, "delivery_ratio_per_flow.png"))
@@ -175,9 +173,9 @@ def main():
     plot_cdf(df, "mean_jitter_ms",
              "Jitter CDF", "ms",
              os.path.join(args.out_dir, "jitter_cdf.png"))
-    plot_cdf(df, "loss_percent",
-             "UDP loss CDF", "%",
-             os.path.join(args.out_dir, "loss_rate_cdf.png"))
+    plot_cdf(df, "tcp_retrans_overhead_percent",
+             "TCP retransmission overhead CDF", "%",
+             os.path.join(args.out_dir, "tcp_retrans_overhead_cdf.png"))
 
     plot_scatter(df, "hop_count", "mean_delay_ms",
                  "Mean delay vs hop count (unweighted)",

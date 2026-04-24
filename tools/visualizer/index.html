@@ -112,22 +112,16 @@
           <input id="queue-size" type="number" min="1" max="100000" value="100" />
         </div>
       </div>
-      <label>Offered load per flow</label>
+      <label>Per-link loss probability</label>
       <div class="row">
         <div>
-          <input id="offered-pps" type="number" min="1" max="200000" value="1000" />
-          <div class="muted">packets / s</div>
-        </div>
-        <div>
           <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0.005" />
-          <div class="muted">per-link loss probability</div>
+          <div class="muted">used only for the packet-animation drop demo</div>
         </div>
       </div>
-      <label>Transport</label>
-      <select id="transport">
-        <option value="tcp" selected>TCP (saturating)</option>
-        <option value="udp">UDP CBR</option>
-      </select>
+      <div class="muted" style="margin-top:6px">
+        Transport: TCP (BulkSend saturating the path bottleneck).
+      </div>
     </div>
 
     <div class="section">

@@ -57,9 +57,7 @@ const ui = {
   linkRate: document.getElementById('link-rate'),
   accessRate: document.getElementById('access-rate'),
   queueSize: document.getElementById('queue-size'),
-  offeredPps: document.getElementById('offered-pps'),
   lossProb: document.getElementById('loss-probability'),
-  transport: document.getElementById('transport'),
   launch: document.getElementById('launch'),
   launchBurst: document.getElementById('launch-burst'),
   steady: document.getElementById('steady'),
@@ -386,23 +384,33 @@ function readParams() {
     islMbps: Math.max(0.001, Number(ui.linkRate.value)),
     accessMbps: Math.max(0.001, Number(ui.accessRate.value)),
     queuePkts: Math.max(1, Number(ui.queueSize.value)),
-    offeredPps: Math.max(1, Number(ui.offeredPps.value)),
     lossProb: Math.max(0, Math.min(1, Number(ui.lossProb.value))),
-    transport: ui.transport.value,
   };
 }
 
-// M/M/1/K finite-buffer queuing estimate (Erlang-B loss).
-// Returns mean queuing delay; packets that would overflow the buffer are
-// counted as losses — the caller uses params.lossProb for that independently.
+// Approximate mean queuing delay using the M/M/1 formula rho/(1-rho) * service,
+// bounded above by queuePkts * servicePacketMs so that the reported delay never
+// exceeds what a finite buffer of `queuePkts` can hold. This is intentionally
+// NOT a full M/M/1/K solution: overflow loss is not computed here, and the
+// per-hop loss input (params.lossProb) is applied independently by the caller.
+// For a proper blocking probability use estimateBlockingProb() below.
 function estimateQueuingMs(rho, servicePacketMs, queuePkts) {
   if (rho <= 0) return 0.0;
-  // M/M/1 mean number in system capped by finite buffer: use infinite-queue
-  // formula bounded so delay never exceeds queuePkts * servicePacketMs.
   const maxQueueMs = queuePkts * servicePacketMs;
   if (rho >= 1.0) return maxQueueMs;
   const meanQueueMs = (rho / (1.0 - rho)) * servicePacketMs;
   return Math.min(meanQueueMs, maxQueueMs);
+}
+
+// M/M/1/K blocking probability (packet loss due to finite buffer K).
+// K is the total system capacity (queue slots + server). Returns PB in [0,1].
+function estimateBlockingProb(rho, K) {
+  if (K <= 0) return 1.0;
+  if (rho <= 0) return 0.0;
+  if (Math.abs(rho - 1.0) < 1e-9) return 1.0 / (K + 1);
+  const num = (1.0 - rho) * Math.pow(rho, K);
+  const den = 1.0 - Math.pow(rho, K + 1);
+  return den > 0 ? num / den : 1.0;
 }
 
 function hopCostsForPath(path, edgeIdxPath, params) {
@@ -412,9 +420,8 @@ function hopCostsForPath(path, edgeIdxPath, params) {
   let totalSerMs = 0.0;
   let totalQueueMs = 0.0;
 
-  // Path bottleneck: for TCP the achievable rate is bounded by the slowest
-  // link along the path (usually the access link, if any). For UDP CBR,
-  // offered load is whatever the user asked for independent of path.
+  // TCP BulkSend saturates the path: the achievable rate is bounded by the
+  // slowest link along the path (usually the access link, if any).
   let bottleneckBps = Infinity;
   for (let i = 0; i < edgeIdxPath.length; ++i) {
     const e = state.edges[edgeIdxPath[i]];
@@ -423,9 +430,7 @@ function hopCostsForPath(path, edgeIdxPath, params) {
   }
   if (!isFinite(bottleneckBps)) bottleneckBps = params.islMbps * 1e6;
 
-  const offeredBps = params.transport === 'tcp'
-    ? bottleneckBps
-    : params.offeredPps * params.packetBytes * 8.0;
+  const offeredBps = bottleneckBps;
 
   for (let i = 0; i < edgeIdxPath.length; ++i) {
     const e = state.edges[edgeIdxPath[i]];
@@ -463,8 +468,8 @@ function renderFlowSummary(dijkstraResult) {
   const params = readParams();
   const costs = hopCostsForPath(dijkstraResult.path, dijkstraResult.edgeIdxPath, params);
   const hops = dijkstraResult.path.length - 1;
-  const isTcp = params.transport === 'tcp';
-  // Bottleneck along the path: min(rate) over edges.
+  // Bottleneck along the path: min(rate) over edges. TCP BulkSend saturates
+  // this; we report it as the effective offered rate.
   let bottleneckMbps = Infinity;
   for (const ei of dijkstraResult.edgeIdxPath) {
     const e = state.edges[ei];
@@ -472,18 +477,16 @@ function renderFlowSummary(dijkstraResult) {
     if (r < bottleneckMbps) bottleneckMbps = r;
   }
   if (!isFinite(bottleneckMbps)) bottleneckMbps = params.islMbps;
-  const offeredMbps = isTcp
-    ? bottleneckMbps                                      // TCP saturates the path bottleneck
-    : params.offeredPps * params.packetBytes * 8.0 / 1e6; // UDP CBR
+  const offeredMbps = bottleneckMbps;
 
   ui.flowSummary.innerHTML = `
-    <div class="kv"><span>Transport</span><span>${params.transport.toUpperCase()}</span></div>
+    <div class="kv"><span>Transport</span><span>TCP</span></div>
     <div class="kv"><span>Hops</span><span>${hops}</span></div>
     <div class="kv"><span>Propagation</span><span>${costs.totalPropMs.toFixed(2)} ms</span></div>
     <div class="kv"><span>Serialization</span><span>${costs.totalSerMs.toFixed(3)} ms</span></div>
     <div class="kv"><span>Queuing (est)</span><span>${costs.totalQueueMs.toFixed(3)} ms</span></div>
     <div class="kv"><span>Total one-way</span><span><b>${costs.totalMs.toFixed(2)} ms</b></span></div>
-    <div class="kv"><span>Offered rate</span><span>${offeredMbps.toFixed(3)} Mbps${isTcp ? ' (saturating)' : ''}</span></div>
+    <div class="kv"><span>Offered rate</span><span>${offeredMbps.toFixed(3)} Mbps (TCP saturating)</span></div>
   `;
 
   ui.hoplist.innerHTML = costs.rows.map(r => `
@@ -549,21 +552,13 @@ function launchBurst(n = 50) {
 
 function startSteadyLoad() {
   stopSteadyLoad();
-  const params = readParams();
-  // Browser setInterval minimum is ~4 ms; cap at 250 pps (one every 4 ms).
-  // For higher rates, batch multiple packets per tick.
-  const MIN_INTERVAL_MS = 4;
-  const requestedInterval = 1000.0 / params.offeredPps;
-  const actualInterval = Math.max(MIN_INTERVAL_MS, requestedInterval);
-  const pktsPerTick = Math.round(actualInterval / requestedInterval);
-  const actualPps = Math.round((pktsPerTick / actualInterval) * 1000);
-  state.steadyTimer = setInterval(() => {
-    for (let k = 0; k < pktsPerTick; ++k) launchPacket();
-  }, actualInterval);
-  const cappedNote = actualPps !== params.offeredPps
-    ? ` (capped at ${actualPps} pps — browser timer limit)`
-    : '';
-  ui.status.textContent = `steady load: ${params.offeredPps} pps${cappedNote}`;
+  // Steady-load demo: fixed animation rate. This drives only the on-screen
+  // packet animation pace — the actual TCP bottleneck math is in readParams().
+  const STEADY_PPS = 50;
+  const STEADY_INTERVAL_MS = 1000.0 / STEADY_PPS;
+  state.steadyTimer = setInterval(() => { launchPacket(); },
+                                  STEADY_INTERVAL_MS);
+  ui.status.textContent = `steady load: ${STEADY_PPS} pps (animation)`;
 }
 function stopSteadyLoad() {
   if (state.steadyTimer) clearInterval(state.steadyTimer);
@@ -701,7 +696,7 @@ function wireUi() {
   });
 
   for (const el of [ui.packetSize, ui.linkRate, ui.accessRate,
-                    ui.queueSize, ui.offeredPps, ui.lossProb, ui.transport]) {
+                    ui.queueSize, ui.lossProb]) {
     el.addEventListener('change', refreshPath);
     el.addEventListener('input', refreshPath);
   }
@@ -743,28 +738,48 @@ async function main() {
       fetchJson(META_URL),
     ]);
 
-    state.nodes = nodesRows.map(r => ({
-      id: Number(r.id),
-      name: r.name,
-      kind: r.kind || 'satellite',
-      shellId: Number(r.shell_id ?? -1),
-      planeId: Number(r.plane_id ?? -1),
-      ecef: [
-        Number(r.ecef_x_km ?? r.x_km ?? 0),
-        Number(r.ecef_y_km ?? r.y_km ?? 0),
-        Number(r.ecef_z_km ?? r.z_km ?? 0),
-      ],
-      lat: Number(r.lat_deg ?? 0),
-      lon: Number(r.lon_deg ?? 0),
-      altKm: Number(r.altitude_km ?? 0),
-    }));
-    // Back-fill ecef if only eci was provided (v1 files).
-    if (!state.nodes.some(n => n.ecef[0] !== 0 || n.ecef[1] !== 0)) {
+    state.nodes = nodesRows.map(r => {
+      const hasEcef = r.ecef_x_km != null
+                   || r.ecef_y_km != null
+                   || r.ecef_z_km != null;
+      const hasEci = r.eci_x_km != null
+                  || r.eci_y_km != null
+                  || r.eci_z_km != null;
+      let x = 0, y = 0, z = 0;
+      if (hasEcef) {
+        x = Number(r.ecef_x_km ?? 0);
+        y = Number(r.ecef_y_km ?? 0);
+        z = Number(r.ecef_z_km ?? 0);
+      } else if (hasEci) {
+        // v1 schema only wrote eci_*; approximate layout using ECI as-if-ECEF.
+        x = Number(r.eci_x_km ?? 0);
+        y = Number(r.eci_y_km ?? 0);
+        z = Number(r.eci_z_km ?? 0);
+      } else {
+        x = Number(r.x_km ?? 0);
+        y = Number(r.y_km ?? 0);
+        z = Number(r.z_km ?? 0);
+      }
+      return {
+        id: Number(r.id),
+        name: r.name,
+        kind: r.kind || 'satellite',
+        shellId: Number(r.shell_id ?? -1),
+        planeId: Number(r.plane_id ?? -1),
+        ecef: [x, y, z],
+        ecefIsActuallyEci: !hasEcef && hasEci,
+        lat: Number(r.lat_deg ?? 0),
+        lon: Number(r.lon_deg ?? 0),
+        altKm: Number(r.altitude_km ?? 0),
+      };
+    });
+    // Warn if the snapshot lacked ECEF and we had to fall back.
+    if (state.nodes.length > 0 && state.nodes.every(n => n.ecefIsActuallyEci)) {
       const msg = document.createElement('div');
       msg.className = 'banner warn';
-      msg.textContent = 'snapshot uses v1 schema (no ECEF). Earth layout will ' +
-        'fall back to ECI. Regenerate the snapshot with the new generator for ' +
-        'accurate geodetic placement.';
+      msg.textContent = 'snapshot uses v1 schema (no ECEF). Earth layout is ' +
+        'approximated from ECI coordinates. Regenerate the snapshot with the ' +
+        'new generator for accurate geodetic placement.';
       ui.metaInfo.parentNode.insertBefore(msg, ui.metaInfo);
     }
     state.edges = edgesRows.map(r => ({

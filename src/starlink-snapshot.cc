@@ -13,9 +13,11 @@
 //   * hop_count_unweighted is counted along the SAME min-delay path that
 //     ns-3 routes over, so `hops` and `shortest_delay_ms` describe the
 //     same route.
-//   * Loss is reported separately for UDP (packet drop) and TCP
-//     (retransmission overhead — not called "loss").
-//   * Throughput, offered load, goodput, and utilization are distinct.
+//   * Transport is TCP-only (BulkSend). Starlink user traffic is TCP/QUIC
+//     in practice; modelling loss/jitter under realistic congestion control
+//     is more meaningful than a raw UDP CBR probe.
+//   * Throughput, goodput, and utilization are distinct. There is no
+//     explicit "offered load" for TCP because BulkSend saturates the path.
 //   * IPv4 allocation uses an explicit /30 subnet allocator that fails
 //     loudly when exhausted instead of silently wrapping.
 //   * NetAnim positions come from the node CSV (ECEF equirectangular) so
@@ -92,8 +94,6 @@ struct AppFlow
   uint32_t srcNode;
   uint32_t dstNode;
   uint16_t port;
-  std::string transport;   // "udp" or "tcp"
-  double offeredBps;       // configured offered load (0 for TCP saturating)
 };
 
 struct PerFlowRow
@@ -102,12 +102,9 @@ struct PerFlowRow
   uint32_t srcNode;
   uint32_t dstNode;
   uint16_t port;
-  std::string transport;
-  double offeredLoadMbps;
   double goodputMbps;
   double deliveryRatioPercent;
-  double packetLossPercent;       // UDP only; NaN for TCP
-  double tcpRetransOverheadPercent; // NaN for UDP
+  double tcpRetransOverheadPercent;
   double meanDelayMs;
   double meanJitterMs;
   uint32_t hopCountUnweighted;
@@ -508,8 +505,13 @@ BuildRandomPairs(const FlowPairBuilderCtx& ctx)
   std::mt19937 rng(ctx.seed);
   std::vector<uint32_t> pool = ctx.candidateNodes;
   std::vector<std::pair<uint32_t, uint32_t>> pairs;
+  // Scale attempt cap with requested flow count so large asks aren't silently
+  // truncated, and reject duplicate (src,dst) pairs.
+  std::set<std::pair<uint32_t, uint32_t>> seen;
+  const int attemptCap = std::max<int>(500,
+                                       static_cast<int>(ctx.numFlows) * 50);
   int attempts = 0;
-  while (pairs.size() < ctx.numFlows && attempts < 500)
+  while (pairs.size() < ctx.numFlows && attempts < attemptCap)
   {
     if (pool.size() < 2) break;
     std::uniform_int_distribution<size_t> di(0, pool.size() - 1);
@@ -517,9 +519,18 @@ BuildRandomPairs(const FlowPairBuilderCtx& ctx)
     uint32_t dst = pool[di(rng)];
     attempts++;
     if (src == dst) continue;
+    auto key = std::make_pair(std::min(src, dst), std::max(src, dst));
+    if (seen.count(key)) continue;
     if (BfsUnweightedHops(ctx.adjUnweighted, src, dst)
         == std::numeric_limits<uint32_t>::max()) continue;
+    seen.insert(key);
     pairs.push_back({src, dst});
+  }
+  if (pairs.size() < ctx.numFlows)
+  {
+    std::cerr << "WARNING: BuildRandomPairs generated only "
+              << pairs.size() << " of " << ctx.numFlows
+              << " requested flows after " << attempts << " attempts.\n";
   }
   return pairs;
 }
@@ -586,16 +597,30 @@ BuildGatewayPairs(const FlowPairBuilderCtx& ctx)
     return BuildRandomPairs(ctx);
   }
   std::uniform_int_distribution<size_t> di(0, ctx.gatewayNodes.size() - 1);
+  std::set<std::pair<uint32_t, uint32_t>> seen;
+  const int attemptCap = std::max<int>(1000,
+                                       static_cast<int>(ctx.numFlows) * 50);
   int attempts = 0;
-  while (pairs.size() < ctx.numFlows && attempts < 1000)
+  while (pairs.size() < ctx.numFlows && attempts < attemptCap)
   {
     attempts++;
     uint32_t src = ctx.gatewayNodes[di(rng)];
     uint32_t dst = ctx.gatewayNodes[di(rng)];
     if (src == dst) continue;
+    auto key = std::make_pair(std::min(src, dst), std::max(src, dst));
+    if (seen.count(key)) continue;
     if (BfsUnweightedHops(ctx.adjUnweighted, src, dst)
         == std::numeric_limits<uint32_t>::max()) continue;
+    seen.insert(key);
     pairs.push_back({src, dst});
+  }
+  if (pairs.size() < ctx.numFlows)
+  {
+    std::cerr << "WARNING: BuildGatewayPairs generated only "
+              << pairs.size() << " of " << ctx.numFlows
+              << " requested gateway flows after " << attempts
+              << " attempts (only " << ctx.gatewayNodes.size()
+              << " gateways).\n";
   }
   return pairs;
 }
@@ -616,12 +641,10 @@ int main(int argc, char* argv[])
   double appStart = 1.0;
   uint32_t numFlows = 4;
   uint32_t packetSize = 1000;
-  double intervalMs = 1.0;
   std::string rate = "20Mbps";
   std::string accessRate = "100Mbps";
   std::string queueSize = "100p";
   bool enableAnim = true;
-  bool useTcp = true;
   std::string flowPatternStr = "random";
   uint32_t seed = 1;
   double fragmentationFailFrac = 0.0;
@@ -635,11 +658,9 @@ int main(int argc, char* argv[])
   cmd.AddValue("rate", "ISL link rate", rate);
   cmd.AddValue("accessRate", "Ground access link rate", accessRate);
   cmd.AddValue("numFlows", "Number of flows", numFlows);
-  cmd.AddValue("packetSize", "Packet/segment size (bytes)", packetSize);
-  cmd.AddValue("intervalMs", "UDP packet interval (ms, ignored for TCP)", intervalMs);
+  cmd.AddValue("packetSize", "TCP segment size (bytes)", packetSize);
   cmd.AddValue("queueSize", "Per-device queue size (e.g. '100p' or '64KB')", queueSize);
   cmd.AddValue("enableAnim", "Enable NetAnim XML output", enableAnim);
-  cmd.AddValue("useTcp", "Use TCP BulkSend instead of UDP CBR", useTcp);
   cmd.AddValue("flowPattern",
                "random|longest|nearest|gateway traffic model",
                flowPatternStr);
@@ -747,7 +768,6 @@ int main(int argc, char* argv[])
     const double W = 2000.0, H = 1000.0;
     for (uint32_t i = 0; i < N; ++i)
     {
-<<<<<<< HEAD
       double lat = 0.0, lon = 0.0;
       std::string desc = "Node-" + std::to_string(i);
       if (i < nodeInfoById.size())
@@ -765,12 +785,6 @@ int main(int argc, char* argv[])
       {
         anim->UpdateNodeColor(nodes.Get(i), 220, 60, 60);
       }
-=======
-      double x = (i % 10) * 50.0;
-      double y = (i / 10) * 50.0;
-      AnimationInterface::SetConstantPosition(nodes.Get(i), x, y);
-      anim->UpdateNodeDescription(nodes.Get(i), "Sat-" + std::to_string(i));
->>>>>>> 731854a6d4c9a3b767737e451949f4921a4b5044
     }
   }
 
@@ -874,60 +888,41 @@ int main(int argc, char* argv[])
   numFlows = pairs.size();
   std::cout << "Flow pattern: " << flowPatternStr
             << ", generated flows: " << pairs.size() << "\n";
-  std::cout << "Transport: " << (useTcp ? "TCP (BulkSend)" : "UDP (CBR)") << "\n";
+  std::cout << "Transport: TCP (BulkSend)\n";
 
-  const uint16_t basePort = 9000;
-  std::vector<AppFlow> appFlows;
-  double perFlowOfferedBps = 0.0;
-  if (!useTcp && intervalMs > 0.0)
+  const uint32_t basePort = 9000;
+  const uint32_t maxPort = 65535;
+  if (basePort + pairs.size() > maxPort + 1)
   {
-    // bytes per second per flow when CBR: pkt/interval_ms * 1000
-    perFlowOfferedBps = (static_cast<double>(packetSize) * 8.0)
-                        * (1000.0 / intervalMs);
+    NS_FATAL_ERROR("Too many flows (" << pairs.size()
+                   << "): basePort " << basePort
+                   << " + numFlows would overflow uint16_t ("
+                   << maxPort << "). Reduce numFlows to at most "
+                   << (maxPort + 1 - basePort) << ".");
   }
+  std::vector<AppFlow> appFlows;
 
   for (uint32_t i = 0; i < pairs.size(); ++i)
   {
     uint32_t src = pairs[i].first;
     uint32_t dst = pairs[i].second;
-    uint16_t port = basePort + i;
+    uint16_t port = static_cast<uint16_t>(basePort + i);
 
-    if (useTcp)
-    {
-      PacketSinkHelper sink("ns3::TcpSocketFactory",
-                            InetSocketAddress(Ipv4Address::GetAny(), port));
-      auto sinkApp = sink.Install(nodes.Get(dst));
-      sinkApp.Start(Seconds(0.0));
-      sinkApp.Stop(Seconds(simTime));
+    PacketSinkHelper sink("ns3::TcpSocketFactory",
+                          InetSocketAddress(Ipv4Address::GetAny(), port));
+    auto sinkApp = sink.Install(nodes.Get(dst));
+    sinkApp.Start(Seconds(0.0));
+    sinkApp.Stop(Seconds(simTime));
 
-      BulkSendHelper source("ns3::TcpSocketFactory",
-                            InetSocketAddress(primaryAddr[dst], port));
-      source.SetAttribute("MaxBytes", UintegerValue(0));
-      source.SetAttribute("SendSize", UintegerValue(packetSize));
-      auto sourceApp = source.Install(nodes.Get(src));
-      sourceApp.Start(Seconds(appStart));
-      sourceApp.Stop(Seconds(simTime));
-    }
-    else
-    {
-      PacketSinkHelper sink("ns3::UdpSocketFactory",
-                            InetSocketAddress(Ipv4Address::GetAny(), port));
-      auto sinkApp = sink.Install(nodes.Get(dst));
-      sinkApp.Start(Seconds(0.0));
-      sinkApp.Stop(Seconds(simTime));
+    BulkSendHelper source("ns3::TcpSocketFactory",
+                          InetSocketAddress(primaryAddr[dst], port));
+    source.SetAttribute("MaxBytes", UintegerValue(0));
+    source.SetAttribute("SendSize", UintegerValue(packetSize));
+    auto sourceApp = source.Install(nodes.Get(src));
+    sourceApp.Start(Seconds(appStart));
+    sourceApp.Stop(Seconds(simTime));
 
-      UdpClientHelper client(primaryAddr[dst], port);
-      client.SetAttribute("MaxPackets", UintegerValue(0));
-      client.SetAttribute("Interval", TimeValue(MilliSeconds(intervalMs)));
-      client.SetAttribute("PacketSize", UintegerValue(packetSize));
-      auto clientApp = client.Install(nodes.Get(src));
-      clientApp.Start(Seconds(appStart));
-      clientApp.Stop(Seconds(simTime));
-    }
-    appFlows.push_back({
-        i, src, dst, port,
-        useTcp ? "tcp" : "udp",
-        useTcp ? 0.0 : perFlowOfferedBps});
+    appFlows.push_back({i, src, dst, port});
     std::cout << "Flow " << i << ": " << src << " -> " << dst
               << " port " << port << "\n";
   }
@@ -946,11 +941,13 @@ int main(int argc, char* argv[])
   std::map<uint16_t, AppFlow> flowByPort;
   for (const auto& f : appFlows) flowByPort[f.port] = f;
 
+  std::set<uint32_t> reportedFlowIndices;
+
   std::vector<PerFlowRow> perFlowRows;
 
-  double totalRxBytes = 0.0, totalTxBytes = 0.0, totalOfferedBytes = 0.0;
+  double totalRxBytes = 0.0, totalTxBytes = 0.0;
   double sumDelaySec = 0.0;
-  uint64_t sumTxPkts = 0, sumRxPkts = 0, sumLostPkts = 0;
+  uint64_t sumRxPkts = 0;
 
   std::cout << "\n=== PER-FLOW RESULTS ===\n";
   for (const auto& kv : stats)
@@ -963,30 +960,16 @@ int main(int argc, char* argv[])
     const auto& s = kv.second;
 
     double goodputMbps = (s.rxBytes * 8.0) / activeDuration / 1e6;
-    double offeredMbps = flow.offeredBps / 1e6;
     double deliveryRatio = s.txBytes
         ? 100.0 * static_cast<double>(s.rxBytes) / s.txBytes : 0.0;
-    double pktLoss = std::numeric_limits<double>::quiet_NaN();
-    double tcpRetransOverhead = std::numeric_limits<double>::quiet_NaN();
-
-    if (flow.transport == "udp")
-    {
-      pktLoss = s.txPackets
-          ? 100.0 * static_cast<double>(s.lostPackets) / s.txPackets : 0.0;
-      if (pktLoss < 0.0) pktLoss = 0.0;
-      if (pktLoss > 100.0) pktLoss = 100.0;
-    }
-    else
-    {
-      // For TCP, lostPackets includes retransmissions at the IP layer.
-      // Report the overhead ratio (retx bytes / delivered bytes), but do
-      // NOT present it as application-level loss (review item 11).
-      tcpRetransOverhead = s.rxBytes
-          ? 100.0 * static_cast<double>(
-              (s.txBytes > s.rxBytes ? s.txBytes - s.rxBytes : 0))
-              / s.rxBytes
-          : 0.0;
-    }
+    // For TCP, FlowMonitor's lostPackets count includes retransmissions at
+    // the IP layer. Report this as a retransmission overhead ratio
+    // (retx bytes / delivered bytes), NOT as application-level loss.
+    double tcpRetransOverhead = s.rxBytes
+        ? 100.0 * static_cast<double>(
+            (s.txBytes > s.rxBytes ? s.txBytes - s.rxBytes : 0))
+            / s.rxBytes
+        : 0.0;
 
     double meanDelayMs = s.rxPackets
         ? (s.delaySum.GetSeconds() / s.rxPackets) * 1000.0 : 0.0;
@@ -999,13 +982,12 @@ int main(int argc, char* argv[])
     uint32_t hops = dj.hops;
     double shortestDelayMs = dj.delayMs;
 
+    reportedFlowIndices.insert(flow.flowIndex);
+
     totalRxBytes += s.rxBytes;
     totalTxBytes += s.txBytes;
-    totalOfferedBytes += flow.offeredBps * activeDuration / 8.0;
     sumDelaySec += s.delaySum.GetSeconds();
-    sumTxPkts += s.txPackets;
     sumRxPkts += s.rxPackets;
-    sumLostPkts += s.lostPackets;
 
     std::cout << "Flow " << flow.flowIndex
               << " " << flow.srcNode << "->" << flow.dstNode
@@ -1014,17 +996,12 @@ int main(int argc, char* argv[])
               << "goodput=" << goodputMbps << " Mbps, "
               << "delivery=" << deliveryRatio << "%, "
               << "meanDelay=" << meanDelayMs << " ms, "
-              << "jitter=" << meanJitterMs << " ms";
-    if (flow.transport == "udp")
-      std::cout << ", pktLoss=" << pktLoss << "%";
-    else
-      std::cout << ", tcpRetransOverhead=" << tcpRetransOverhead << "%";
-    std::cout << "\n";
+              << "jitter=" << meanJitterMs << " ms, "
+              << "tcpRetransOverhead=" << tcpRetransOverhead << "%\n";
 
     perFlowRows.push_back({
       flow.flowIndex, flow.srcNode, flow.dstNode, flow.port,
-      flow.transport, offeredMbps, goodputMbps, deliveryRatio,
-      pktLoss, tcpRetransOverhead,
+      goodputMbps, deliveryRatio, tcpRetransOverhead,
       meanDelayMs, meanJitterMs,
       (hops == std::numeric_limits<uint32_t>::max() ? 0u : hops),
       shortestDelayMs,
@@ -1033,20 +1010,47 @@ int main(int argc, char* argv[])
     });
   }
 
+  // Surface any configured flows that did not appear in FlowMonitor stats:
+  // those would otherwise be silently omitted from the CSV / aggregates.
+  std::vector<uint32_t> missingFlows;
+  for (const auto& f : appFlows)
+  {
+    if (!reportedFlowIndices.count(f.flowIndex))
+      missingFlows.push_back(f.flowIndex);
+  }
+  if (!missingFlows.empty())
+  {
+    std::cerr << "WARNING: " << missingFlows.size() << " of "
+              << appFlows.size() << " configured flow(s) had no FlowMonitor "
+              << "statistics and are excluded from aggregates: ";
+    for (size_t i = 0; i < missingFlows.size(); ++i)
+    {
+      std::cerr << missingFlows[i] << (i + 1 < missingFlows.size() ? "," : "");
+    }
+    std::cerr << "\n";
+    for (uint32_t idx : missingFlows)
+    {
+      const AppFlow& f = appFlows[idx];
+      perFlowRows.push_back({
+        f.flowIndex, f.srcNode, f.dstNode, f.port,
+        0.0, 0.0,
+        std::numeric_limits<double>::quiet_NaN(),
+        0.0, 0.0, 0u, 0.0,
+        0ull, 0ull, 0ull, 0ull, 0ull
+      });
+    }
+  }
+
   double aggGoodputMbps = (totalRxBytes * 8.0) / activeDuration / 1e6;
-  double aggOfferedLoadMbps = useTcp
-      ? 0.0
-      : (totalOfferedBytes * 8.0) / activeDuration / 1e6;
   double aggTxLoadMbps = (totalTxBytes * 8.0) / activeDuration / 1e6;
-  double aggPacketLoss = (!useTcp && sumTxPkts)
-      ? 100.0 * static_cast<double>(sumLostPkts) / sumTxPkts
-      : 0.0;
   double meanDelayMs = sumRxPkts ? (sumDelaySec / sumRxPkts) * 1000.0 : 0.0;
 
-  // Utilization: aggregate offered load / total installed ISL capacity. This
-  // is a rough upper bound that answers "how loaded is the network?" — it is
-  // NOT an oracle for bottleneck links but is still much more informative
-  // than the old throughput-over-duration number (review item 12).
+  // Aggregate "utilization" here is a coarse, network-wide loading indicator
+  // (aggregate Tx load / total installed capacity). It is NOT per-link
+  // utilization and cannot reveal bottlenecks on individual hops — a
+  // congested link can sit next to many idle links and still produce a low
+  // aggregate number. Tx load is the right numerator here because TCP
+  // BulkSend has no well-defined "offered rate".
   auto parseRateMbps = [](const std::string& r) -> double {
     double v = 0; std::string u; std::istringstream ss(r);
     ss >> v >> u;
@@ -1060,19 +1064,16 @@ int main(int argc, char* argv[])
   double accessMbps = parseRateMbps(accessRate);
   double totalCapacityMbps = linksISL * islMbps + linksAccess * accessMbps;
   double utilization = totalCapacityMbps > 0.0
-      ? aggGoodputMbps / totalCapacityMbps * 100.0 : 0.0;
+      ? aggTxLoadMbps / totalCapacityMbps * 100.0 : 0.0;
 
   std::cout << "\n=== OVERALL RESULTS ===\n";
-  std::cout << "Offered load:  " << aggOfferedLoadMbps << " Mbps "
-            << "(TCP: N/A — source is saturating)\n";
   std::cout << "Tx load:       " << aggTxLoadMbps << " Mbps\n";
   std::cout << "Goodput:       " << aggGoodputMbps << " Mbps\n";
   std::cout << "Utilization:   " << utilization << " % "
-            << "of " << totalCapacityMbps << " Mbps installed capacity\n";
+            << "of " << totalCapacityMbps << " Mbps installed capacity "
+            << "(aggregate Tx load / total capacity; not per-link)\n";
   std::cout << "Mean delay:    " << meanDelayMs << " ms\n";
-  std::cout << "Pkt loss:      "
-            << (useTcp ? std::string("N/A (TCP run)")
-                       : std::to_string(aggPacketLoss) + " %") << "\n";
+  std::cout << "Retrans:       (see per-flow tcpRetransOverhead)\n";
 
   // Write per-flow CSV atomically.
   std::string tmpOut = perFlowOut + ".tmp";
@@ -1081,8 +1082,8 @@ int main(int argc, char* argv[])
     if (!csv.is_open()) NS_FATAL_ERROR("Cannot write " << tmpOut);
     csv << "schema_version=" << SCHEMA_VERSION << "\n";
     csv << "flow_index,src_node,dst_node,port,transport,"
-           "offered_load_mbps,goodput_mbps,delivery_ratio_percent,"
-           "packet_loss_percent,tcp_retrans_overhead_percent,"
+           "goodput_mbps,delivery_ratio_percent,"
+           "tcp_retrans_overhead_percent,"
            "mean_delay_ms,mean_jitter_ms,"
            "hop_count_unweighted,shortest_delay_ms,"
            "tx_packets,rx_packets,lost_packets,tx_bytes,rx_bytes\n";
@@ -1093,10 +1094,9 @@ int main(int argc, char* argv[])
     for (const auto& r : perFlowRows)
     {
       csv << r.flowIndex << "," << r.srcNode << "," << r.dstNode << ","
-          << r.port << "," << r.transport << ","
-          << r.offeredLoadMbps << "," << r.goodputMbps << ","
+          << r.port << ",tcp,"
+          << r.goodputMbps << ","
           << r.deliveryRatioPercent << ","
-          << nanToStr(r.packetLossPercent) << ","
           << nanToStr(r.tcpRetransOverheadPercent) << ","
           << r.meanDelayMs << "," << r.meanJitterMs << ","
           << r.hopCountUnweighted << "," << r.shortestDelayMs << ","
@@ -1118,10 +1118,9 @@ int main(int argc, char* argv[])
       j << "  \"sim_time_s\": " << simTime << ",\n";
       j << "  \"app_start_s\": " << appStart << ",\n";
       j << "  \"num_flows\": " << appFlows.size() << ",\n";
-      j << "  \"transport\": \"" << (useTcp ? "tcp" : "udp") << "\",\n";
+      j << "  \"transport\": \"tcp\",\n";
       j << "  \"flow_pattern\": \"" << flowPatternStr << "\",\n";
       j << "  \"packet_size_bytes\": " << packetSize << ",\n";
-      j << "  \"udp_interval_ms\": " << intervalMs << ",\n";
       j << "  \"isl_rate\": \"" << rate << "\",\n";
       j << "  \"access_rate\": \"" << accessRate << "\",\n";
       j << "  \"queue_size\": \"" << queueSize << "\",\n";
@@ -1129,7 +1128,7 @@ int main(int argc, char* argv[])
       j << "  \"installed_access_links\": " << linksAccess << ",\n";
       j << "  \"installed_capacity_mbps\": " << totalCapacityMbps << ",\n";
       j << "  \"aggregate_goodput_mbps\": " << aggGoodputMbps << ",\n";
-      j << "  \"aggregate_offered_mbps\": " << aggOfferedLoadMbps << ",\n";
+      j << "  \"aggregate_tx_load_mbps\": " << aggTxLoadMbps << ",\n";
       j << "  \"utilization_percent\": " << utilization << "\n";
       j << "}\n";
     }
