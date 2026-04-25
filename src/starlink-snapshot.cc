@@ -700,7 +700,19 @@ int main(int argc, char* argv[])
 {
   std::string edgesPath = "results/snapshot_edges.csv";
   std::string nodesPath = "results/snapshot_nodes.csv";
+<<<<<<< HEAD
   std::string metaPath = "results/snapshot_meta.json";
+=======
+  double simTime = 10.0;
+  std::string rate = "20Mbps";
+  uint32_t numFlows = 4;
+  double appStart = 1.0;
+  uint32_t packetSize = 1000;
+  double intervalMs = 1.0;
+  uint32_t queuePackets = 20;
+  bool enableAnim = false;
+  bool useTcp = false;
+>>>>>>> 5381ee7 (.)
   std::string perFlowOut = "results/per_flow_metrics.csv";
   std::string runMetaOut = "results/run_meta.json";
 

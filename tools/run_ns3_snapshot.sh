@@ -31,6 +31,7 @@ fi
 mkdir -p "${repo_root}/results" "${ns3_dir}/scratch" "${ns3_dir}/results"
 cp "${repo_root}/src/starlink-snapshot.cc" "${ns3_dir}/scratch/starlink-snapshot.cc"
 
+<<<<<<< HEAD
 snapshot_edges="${repo_root}/results/snapshot_edges.csv"
 snapshot_nodes="${repo_root}/results/snapshot_nodes.csv"
 snapshot_meta="${repo_root}/results/snapshot_meta.json"
@@ -40,6 +41,21 @@ for f in "${snapshot_edges}" "${snapshot_nodes}"; do
     echo "Missing required snapshot input: ${f}" >&2
     echo "Run tools/generate_snapshot.sh first." >&2
     exit 2
+=======
+rm -f \
+  "${repo_root}/results/flowmon.xml" \
+  "${repo_root}/results/per_flow_metrics.csv"
+
+rm -f \
+  "${ns3_dir}/results/flowmon.xml" \
+  "${ns3_dir}/results/per_flow_metrics.csv" \
+  "${ns3_dir}/results/snapshot_edges.csv" \
+  "${ns3_dir}/results/snapshot_nodes.csv"
+
+for input_file in snapshot_edges.csv snapshot_nodes.csv; do
+  if [[ -f "${repo_root}/results/${input_file}" ]]; then
+    cp "${repo_root}/results/${input_file}" "${ns3_dir}/results/${input_file}"
+>>>>>>> 5381ee7 (.)
   fi
 done
 
@@ -82,10 +98,17 @@ printf -v run_spec '%q ' starlink-snapshot "${scenario_args[@]}"
 stage_dir="$(mktemp -d "${repo_root}/results/.stage-XXXXXX")"
 trap 'rm -rf "${stage_dir}"' EXIT
 for output_file in \
+<<<<<<< HEAD
     flowmon.xml \
     per_flow_metrics.csv \
     starlink-animation.xml \
     run_meta.json; do
+=======
+  flowmon.xml \
+  per_flow_metrics.csv \
+  snapshot_edges.csv \
+  snapshot_nodes.csv; do
+>>>>>>> 5381ee7 (.)
   if [[ -f "${ns3_dir}/results/${output_file}" ]]; then
     cp "${ns3_dir}/results/${output_file}" "${stage_dir}/${output_file}"
   fi
