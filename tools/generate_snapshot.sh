@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Generate a network snapshot from the checked-in TLE dataset.
+# Generate a network snapshot from live CelesTrak TLE data.
 #
-# The Python generator writes outputs atomically; this wrapper just makes
-# sure the target directory exists before the Python call (review item 23)
-# and forwards any extra args verbatim so users can pass --utc, --n, etc.
+# By default this fetches fresh Starlink TLEs from CelesTrak at runtime
+# (supplemental feed, then GP feed as fallback). If the network is unavailable,
+# it automatically falls back to datasets/starlink.tle.
+#
+# Pass --no_live to skip the network fetch and always use the local file.
+# Pass --utc, --n, --seed, --starlink_operational etc. as extra args.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

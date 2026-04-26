@@ -700,19 +700,7 @@ int main(int argc, char* argv[])
 {
   std::string edgesPath = "results/snapshot_edges.csv";
   std::string nodesPath = "results/snapshot_nodes.csv";
-<<<<<<< HEAD
   std::string metaPath = "results/snapshot_meta.json";
-=======
-  double simTime = 10.0;
-  std::string rate = "20Mbps";
-  uint32_t numFlows = 4;
-  double appStart = 1.0;
-  uint32_t packetSize = 1000;
-  double intervalMs = 1.0;
-  uint32_t queuePackets = 20;
-  bool enableAnim = false;
-  bool useTcp = false;
->>>>>>> 5381ee7 (.)
   std::string perFlowOut = "results/per_flow_metrics.csv";
   std::string runMetaOut = "results/run_meta.json";
 
@@ -742,6 +730,8 @@ int main(int argc, char* argv[])
   std::string flowPatternStr = "gateway";
   uint32_t seed = 1;
   double fragmentationFailFrac = 0.0;
+  bool printFlows = false;
+  bool verbose = false;
 
   CommandLine cmd;
   cmd.AddValue("edges", "CSV edge file", edgesPath);
@@ -764,7 +754,15 @@ int main(int argc, char* argv[])
   cmd.AddValue("fragmentationFailFrac",
                "Fail if largest_cc/num_nodes < this (0 to disable)",
                fragmentationFailFrac);
+  cmd.AddValue("printFlows",
+               "Print per-flow setup and per-flow result lines on stdout. "
+               "Off by default; the per-flow CSV is always written.",
+               printFlows);
+  cmd.AddValue("verbose",
+               "Alias for --printFlows; also leaves all info messages.",
+               verbose);
   cmd.Parse(argc, argv);
+  if (verbose) printFlows = true;
 
   if (appStart >= simTime)
   {
@@ -1053,8 +1051,11 @@ int main(int argc, char* argv[])
     sourceApp.Stop(Seconds(simTime));
 
     appFlows.push_back({i, src, dst, port});
-    std::cout << "Flow " << i << ": " << src << " -> " << dst
-              << " port " << port << "\n";
+    if (printFlows)
+    {
+      std::cout << "Flow " << i << ": " << src << " -> " << dst
+                << " port " << port << "\n";
+    }
   }
 
   FlowMonitorHelper fm;
@@ -1079,7 +1080,7 @@ int main(int argc, char* argv[])
   double sumDelaySec = 0.0;
   uint64_t sumRxPkts = 0;
 
-  std::cout << "\n=== PER-FLOW RESULTS ===\n";
+  if (printFlows) std::cout << "\n=== PER-FLOW RESULTS ===\n";
   for (const auto& kv : stats)
   {
     if (!classifier) continue;
@@ -1119,15 +1120,18 @@ int main(int argc, char* argv[])
     sumDelaySec += s.delaySum.GetSeconds();
     sumRxPkts += s.rxPackets;
 
-    std::cout << "Flow " << flow.flowIndex
-              << " " << flow.srcNode << "->" << flow.dstNode
-              << " (" << (hops == std::numeric_limits<uint32_t>::max() ? 0u : hops)
-              << " hops, weighted " << shortestDelayMs << " ms): "
-              << "goodput=" << goodputMbps << " Mbps, "
-              << "delivery=" << deliveryRatio << "%, "
-              << "meanDelay=" << meanDelayMs << " ms, "
-              << "jitter=" << meanJitterMs << " ms, "
-              << "tcpRetransOverhead=" << tcpRetransOverhead << "%\n";
+    if (printFlows)
+    {
+      std::cout << "Flow " << flow.flowIndex
+                << " " << flow.srcNode << "->" << flow.dstNode
+                << " (" << (hops == std::numeric_limits<uint32_t>::max() ? 0u : hops)
+                << " hops, weighted " << shortestDelayMs << " ms): "
+                << "goodput=" << goodputMbps << " Mbps, "
+                << "delivery=" << deliveryRatio << "%, "
+                << "meanDelay=" << meanDelayMs << " ms, "
+                << "jitter=" << meanJitterMs << " ms, "
+                << "tcpRetransOverhead=" << tcpRetransOverhead << "%\n";
+    }
 
     perFlowRows.push_back({
       flow.flowIndex, flow.srcNode, flow.dstNode, flow.port,

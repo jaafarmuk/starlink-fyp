@@ -1,7 +1,4 @@
-<<<<<<< HEAD
 step,epoch_utc,num_nodes,num_satellites,num_gateways,num_edges,num_isl,num_access,num_shells,num_components,largest_cc_size,isolated_nodes,mean_isl_km,max_isl_km,min_isl_km,mean_access_km
 0,2026-03-21T19:24:37.899Z,410,400,10,691,669,22,1,6,405,5,2201.08,4979.25,135.29,767.1
-=======
-num_nodes,num_edges,num_planes,isolated_nodes,largest_cc_size,mean_degree,max_degree,mean_isl_distance_km,max_isl_distance_km
-200,299,19,5,168,2.99,4,974.7,4361.9
->>>>>>> 5381ee7 (.)
+1,2026-03-21T19:33:37.899Z,410,400,10,684,667,17,1,8,403,7,2223.18,4979.39,101.45,834.86
+2,2026-03-21T19:42:37.899Z,410,400,10,683,659,24,2,7,404,6,2218.47,4988.06,188.41,745.78

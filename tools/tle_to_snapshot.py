@@ -59,10 +59,17 @@ import math
 import os
 import sys
 import tempfile
+import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional
+
+# CelesTrak live TLE sources for Starlink.
+# Supplemental feed is derived from SpaceX ephemeris data (more accurate).
+# GP feed is the standard NORAD tracking data (fallback).
+_LIVE_URL_SUPPLEMENTAL = "https://celestrak.org/NORAD/elements/supplemental/starlink.txt"
+_LIVE_URL_GP = "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle"
 
 import numpy as np
 import pandas as pd
@@ -313,9 +320,8 @@ def classical_elements(r_eci_km: np.ndarray,
 # TLE parsing
 # ---------------------------------------------------------------------------
 
-def read_tles(path: str) -> list[tuple[str, str, str]]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        lines = [ln.strip() for ln in fh if ln.strip()]
+def _parse_tle_lines(lines: list[str]) -> list[tuple[str, str, str]]:
+    """Parse a list of stripped non-empty TLE text lines into (name, l1, l2) triples."""
     sats = []
     i = 0
     while i < len(lines):
@@ -334,6 +340,39 @@ def read_tles(path: str) -> list[tuple[str, str, str]]:
         else:
             i += 1
     return sats
+
+
+def read_tles(path: str) -> list[tuple[str, str, str]]:
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip()]
+    return _parse_tle_lines(lines)
+
+
+def fetch_tle_live(timeout: int = 20) -> tuple[list[tuple[str, str, str]], str]:
+    """Fetch live Starlink TLEs from CelesTrak.
+
+    Tries the supplemental feed first (SpaceX ephemeris-derived), then falls
+    back to the standard GP feed. Returns (tles, source_url).
+    Raises RuntimeError if both URLs fail.
+    """
+    for url in (_LIVE_URL_SUPPLEMENTAL, _LIVE_URL_GP):
+        try:
+            print(f"Fetching live TLEs from {url} ...", flush=True)
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "starlink-fyp/1.0 (academic research)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="ignore")
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            tles = _parse_tle_lines(lines)
+            if tles:
+                print(f"Fetched {len(tles)} TLEs from {url}.")
+                return tles, url
+            print(f"WARNING: {url} returned no parseable TLEs, trying next source.")
+        except Exception as exc:
+            print(f"WARNING: could not fetch {url}: {exc}", file=sys.stderr)
+    raise RuntimeError("All live TLE sources failed. Use --no_live to fall back to the local file.")
 
 
 def tle_epoch_jd(satrec: Satrec) -> float:
@@ -1064,7 +1103,15 @@ def validate_topology(sats: list[dict],
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Build a physically consistent snapshot from TLEs.")
-    ap.add_argument("--tle", required=True)
+    ap.add_argument("--tle", default="datasets/starlink.tle",
+                    help="Path to local TLE file (used as fallback when --live "
+                         "is set, or as sole source when --no_live is set).")
+    live_grp = ap.add_mutually_exclusive_group()
+    live_grp.add_argument("--live", dest="live", action="store_true", default=True,
+                          help="Fetch TLEs from CelesTrak at runtime (default). "
+                               "Falls back to --tle file if all URLs fail.")
+    live_grp.add_argument("--no_live", dest="live", action="store_false",
+                          help="Use only the local --tle file; skip network fetch.")
     ap.add_argument("--edges_out", default="results/snapshot_edges.csv")
     ap.add_argument("--nodes_out", default="results/snapshot_nodes.csv")
     ap.add_argument("--stats_out", default="results/topology_stats.csv")
@@ -1483,9 +1530,19 @@ def main():
             "--epoch_steps > 1 requires --multi_epoch_seconds > 0; "
             "otherwise every step reports the same epoch.")
 
-    all_tles = read_tles(args.tle)
+    tle_source = args.tle
+    if args.live:
+        try:
+            all_tles, tle_source = fetch_tle_live()
+        except RuntimeError as exc:
+            print(f"WARNING: live fetch failed ({exc}); falling back to {args.tle}.",
+                  file=sys.stderr)
+            all_tles = read_tles(args.tle)
+    else:
+        all_tles = read_tles(args.tle)
+
     if not all_tles:
-        raise SystemExit(f"No TLEs found in {args.tle}")
+        raise SystemExit(f"No TLEs found in {tle_source}")
 
     # Parse all TLEs, then apply operational filters BEFORE sampling so
     # --n operates on the post-filter population (otherwise a small head
@@ -1687,7 +1744,8 @@ def main():
             "scheduling, gateway/PoP hops and internet transit."),
         "sampling": {
             "mode": args.sample, "n": args.n, "seed": args.seed,
-            "tle_file": os.path.abspath(args.tle),
+            "tle_source": tle_source,
+            "tle_local_fallback": os.path.abspath(args.tle),
             "shell_selection": shell_selection,
         },
         "cli": {k: getattr(args, k) for k in vars(args)},

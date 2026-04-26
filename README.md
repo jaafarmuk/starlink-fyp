@@ -1,38 +1,70 @@
-# Starlink FYP: LEO Network Snapshot and ns-3 Simulation
+# Starlink FYP: Multi-tier LEO Reliability vs. Real Starlink TLE Snapshots
 
-This project builds a physically plausible Starlink-like low Earth orbit
-network snapshot from TLE data, converts that snapshot into a network topology,
-and runs traffic simulations over it with ns-3. It also includes a browser
-visualizer for inspecting satellites, gateways, links, routes, and approximate
-per-hop delay.
+This project compares the analytical multi-hop interruption probability from
+Wang, Kishk, and Alouini (arXiv:2303.02286, 2023) against empirical multi-hop
+routing measured on real Starlink TLE snapshots. The accompanying ns-3 TCP
+simulation and Three.js visualizer are kept as supporting tooling.
 
 The project is not a reverse-engineered model of the real Starlink production
 network. Real Starlink ISL scheduling, gateway/PoP choices, beam assignment,
-capacity sharing, and routing policies are proprietary. This project uses
-public TLE data plus documented geometric and network-simulation assumptions.
+capacity sharing, and routing policies are proprietary. The built-in gateways
+are clearly labelled `GW-DEMO-*` and are demo placeholders. Public TLEs plus
+documented geometric assumptions are the only inputs.
+
+## Research Contribution
+
+The research question is:
+
+> How well does the BPP analytical interruption-probability model from
+> Wang et al. (2023) predict empirical multi-hop routing reliability on
+> real Starlink TLE snapshots?
+
+The pipeline answers this in four steps:
+
+1. Pull a recent Starlink TLE batch (live CelesTrak feed, or
+   `datasets/starlink.tle`).
+2. Use SGP4 to propagate satellites to one or more common epochs spanning
+   roughly an orbital period (`--epoch_steps`, `--multi_epoch_seconds`).
+3. For each epoch, run `tools/analyze_mhr_reliability.py` to:
+   - infer Wang-style tiers (gateway tier + per-altitude satellite tiers)
+     from the snapshot,
+   - evaluate the analytical model end-to-end: tier-to-tier interruption
+     (eq. 2), single-hop interruption (eq. 3), TPMs T^(1)/T~^(2)/T^^(3),
+     stationary distribution v, mu_1 (eq. 4), N_h (eq. 5), and the
+     multi-hop interruption probability P~^M (eq. 7),
+   - empirically simulate Wang-style greedy multi-hop forwarding across
+     random (src, dst) pairs on the real geometry,
+   - report empirical vs analytical interruption probability, absolute
+     and relative error, mean success hops, and the interrupted-hop index
+     per priority strategy and epoch.
+4. Plot the comparison with `tools/plot_mhr_reliability.py`.
 
 ## What The Project Does
 
 1. Reads Starlink TLE records from `datasets/starlink.tle`.
 2. Optionally filters the TLE set to a more operational-looking Starlink subset.
-3. Propagates satellites to one common epoch using SGP4.
+3. Propagates satellites to one (or several) common epochs using SGP4.
 4. Converts orbital positions into ECI/ECEF/geodetic coordinates.
 5. Groups satellites into shells and planes.
 6. Builds inter-satellite links and gateway access links.
 7. Writes snapshot files in `results/`.
-8. Runs a frozen-time ns-3 TCP simulation over the generated topology.
-9. Provides a Three.js visualizer for interactive inspection.
+8. Computes the BPP analytical reliability (Wang et al.) and the matching
+   empirical reliability over the snapshot, and emits CSV/JSON/PNG comparison output.
+9. Optionally runs a frozen-time ns-3 TCP simulation over the topology.
+10. Optionally serves a Three.js visualizer for educational inspection.
 
 ## Main Files
 
-- `tools/tle_to_snapshot.py`: TLE parser, satellite propagation, shell/plane grouping, link generation, validation, and CSV/JSON output.
+- `tools/tle_to_snapshot.py`: TLE parser, satellite propagation, shell/plane grouping, link generation, validation, and CSV/JSON output. Supports multi-epoch generation through `--epoch_steps` and `--multi_epoch_seconds`.
+- `tools/analyze_mhr_reliability.py`: implements the Wang et al. (arXiv:2303.02286) analytical model and the matching empirical multi-hop simulator; emits the comparison CSV/JSON.
+- `tools/plot_mhr_reliability.py`: matplotlib plots of empirical vs analytical interruption probability, absolute error, and per-strategy comparison.
 - `src/starlink-snapshot.cc`: ns-3 scenario that reads the snapshot and simulates TCP flows.
-- `tools/visualizer/index.html` and `tools/visualizer/app.js`: interactive 3D topology and packet/path visualizer.
+- `tools/visualizer/index.html` and `tools/visualizer/app.js`: optional educational 3D topology and packet/path visualizer.
 - `tools/generate_snapshot.sh`: wrapper for generating snapshot files.
 - `tools/run_ns3_snapshot.sh`: wrapper for running the ns-3 scenario.
 - `tools/run_visualizer.sh`: serves the browser visualizer locally.
 - `tools/plot_flow_metrics.py`: plots per-flow ns-3 metrics.
-- `results/`: generated snapshot and simulation output files.
+- `results/`: generated snapshot, reliability comparison, and simulation output files.
 
 ## What We Used
 
@@ -124,7 +156,68 @@ By default, `--shell_select largest` is enabled. Use `--shell_select none`
 only if you intentionally want a multi-shell population and understand that
 the resulting graph may fragment.
 
-### 4. Run With ns-3
+For multi-epoch sweeps over roughly one orbital period, add
+`--epoch_steps` and `--multi_epoch_seconds`. The recommended
+research-grade command (single-shell, ~1600 satellites, 10 epochs over 90
+minutes) is:
+
+```bash
+tools/generate_snapshot.sh --no_live --n 1600 --sample random --seed 1 \
+    --starlink_operational --shell_select largest \
+    --epoch_steps 10 --multi_epoch_seconds 540
+```
+
+This produces the base files plus `snapshot_nodes.t1.csv` ..
+`snapshot_nodes.t9.csv` and the matching `snapshot_edges.t*.csv`. All epoch
+metadata is recorded in `snapshot_meta.json` under `validation_per_step`.
+
+### 4. Run The MHR Reliability Comparison
+
+```bash
+python tools/analyze_mhr_reliability.py --pairs 200 --seed 1
+```
+
+The analyser auto-discovers all epoch CSVs (`snapshot_nodes.csv` plus
+`snapshot_nodes.t1.csv` and so on). Outputs:
+
+```text
+results/mhr_reliability_summary.csv      one row per (strategy, epoch)
+results/mhr_reliability_per_epoch.csv    same data, organised by epoch
+results/mhr_reliability_summary.json     full nested summary
+results/mhr_reliability_per_pair.csv     only with --write-per-pair
+```
+
+Useful flags:
+
+```bash
+# Different physical assumptions:
+python tools/analyze_mhr_reliability.py --theta_r 0.6 --theta_s 0.3 --d_th_km 5000
+
+# Use the paper's fixed theta_m (default uses the observed mean of sampled pairs):
+python tools/analyze_mhr_reliability.py --theta_m 3.14159 --theta_m_mode fixed
+
+# Per-pair audit:
+python tools/analyze_mhr_reliability.py --pairs 100 --write-per-pair
+```
+
+Then plot:
+
+```bash
+python tools/plot_mhr_reliability.py
+```
+
+This writes:
+
+```text
+results/mhr_reliability_overview.png       empirical vs analytical, per epoch
+results/mhr_reliability_error.png          absolute error per epoch
+results/mhr_reliability_by_strategy.png    bar chart, mean over epochs
+```
+
+The comparison is independent of ns-3. ns-3 still runs over the same
+snapshot for end-to-end TCP results.
+
+### 5. Run With ns-3
 
 Install/build ns-3 first. By default, the wrapper expects the ns-3 checkout at:
 
@@ -160,7 +253,7 @@ tools/run_ns3_snapshot.sh --numFlows=8 --simTime=20 --flowPattern=gateway
 tools/run_ns3_snapshot.sh --rate=1Gbps --accessRate=1Gbps --queueSize=1000p
 ```
 
-### 5. Run The Visualizer
+### 6. Run The Visualizer (optional, educational)
 
 Serve the repository locally:
 
@@ -175,9 +268,11 @@ http://localhost:8000/tools/visualizer/
 ```
 
 The visualizer reads the generated `results/snapshot_nodes.csv`,
-`results/snapshot_edges.csv`, and `results/snapshot_meta.json`.
+`results/snapshot_edges.csv`, and `results/snapshot_meta.json`. It is
+provided as an educational view of the snapshot. Its queueing model is
+simplified and is not part of the research comparison.
 
-### 6. Plot ns-3 Flow Metrics
+### 7. Plot ns-3 Flow Metrics
 
 After running ns-3:
 
@@ -187,21 +282,34 @@ python tools/plot_flow_metrics.py
 
 ## Generated Outputs
 
-- `results/snapshot_nodes.csv`: satellite and gateway nodes.
-- `results/snapshot_edges.csv`: ISL and ground access links.
-- `results/snapshot_meta.json`: generator settings, schema, filters, caveats, and validation.
-- `results/topology_stats.csv`: connectivity and distance summary.
+Snapshot generator (per epoch step k; t0 omits the suffix):
+
+- `results/snapshot_nodes.csv` (and `.t1.csv`, `.t2.csv`, ...): satellite and gateway nodes.
+- `results/snapshot_edges.csv` (and `.t1.csv`, ...): ISL and ground access links.
+- `results/snapshot_meta.json`: generator settings, schema, filters, caveats, and per-step validation.
+- `results/topology_stats.csv`: connectivity and distance summary, one row per epoch.
+
+MHR reliability comparison:
+
+- `results/mhr_reliability_summary.csv`: one row per (strategy, epoch).
+- `results/mhr_reliability_per_epoch.csv`: same data, organised by epoch.
+- `results/mhr_reliability_summary.json`: nested summary including parameters.
+- `results/mhr_reliability_per_pair.csv`: per-pair success/interrupt log (only with `--write-per-pair`).
+- `results/mhr_reliability_overview.png`, `mhr_reliability_error.png`, `mhr_reliability_by_strategy.png`: plots.
+
+ns-3:
+
 - `results/per_flow_metrics.csv`: ns-3 per-flow results.
 - `results/run_meta.json`: ns-3 run metadata.
 - `results/flowmon.xml`: ns-3 FlowMonitor output.
 
 ## Important Modeling Notes
 
-- The topology is a frozen-time snapshot. Satellite movement during the ns-3 run is not modeled.
-- Built-in gateways are demo locations named `GW-DEMO-*`, not official Starlink gateway sites.
+- The topology is a frozen-time snapshot. Satellite movement during the ns-3 run is not modeled. The Wang reliability comparison uses several frozen snapshots across an orbital period instead.
+- Built-in gateways are demo locations named `GW-DEMO-*`, not official Starlink gateway sites. The Wang ground tier inherits these placeholders unless a real `--gateways_csv` is provided.
 - Edge delay is one-way vacuum propagation delay, not real ping latency.
-- The default traffic pattern is gateway-to-gateway because random satellite-to-satellite user flows are not realistic for Starlink user traffic.
-- The visualizer is educational. Its queueing and retransmission behavior are simplified and should not replace ns-3 results.
+- The default ns-3 traffic pattern is gateway-to-gateway because random satellite-to-satellite user flows are not realistic for Starlink user traffic.
+- The visualizer is educational. Its queueing and retransmission behavior are simplified and are not part of the research comparison.
 - Strict validation is enabled by default so obviously bad topologies fail instead of silently producing misleading results.
 
 ## Equations Used
@@ -415,6 +523,37 @@ aggregate_cap_utilization_percent =
 This is only a coarse network-wide indicator. Per-link utilization is more
 important for finding bottlenecks.
 
+### 17. Wang BPP Multi-tier Reliability
+
+For tiers indexed 1..K with R_i the orbital radius, N_i the number of
+relays in tier i, and threshold parameters theta_r (max direction angle),
+theta_s (min dome angle), d_th (max reliable distance):
+
+```text
+theta_{i,j} = max(theta_s, min(arccos((R_i^2 + R_j^2 - d_th^2) / (2 R_i R_j)),
+                                arccos(R_1/R_i) + arccos(R_1/R_j)))            (eq. 1)
+
+P^I_{i,j}   = (1 - (theta_r / (4*pi)) * (cos(theta_s) - cos(theta_{i,j})))^N    (eq. 2)
+              N = N_j   if i != j
+              N = N_i-1 if i == j
+
+P^S_i       = prod_j P^I_{i,j}                                                  (eq. 3)
+mu_i        = 1 + sum_j T~^(2)_{i,j} * mu_j   on transient states               (eq. 4)
+N_h         = round(theta_m / theta_o)                                          (eq. 5)
+P~^M        = e_1 * (T~^(2))^(N_h - 2) * T^^(3) * e_{K+1}^T                     (eq. 7)
+```
+
+Where T^(1), T~^(2), T^^(3) are the priority-strategy-conditioned
+transition matrices from Wang algorithms 1, 2, 3, and v is the stationary
+distribution of T^(1). The empirical interruption probability is the
+fraction of simulated (src, dst) routes whose Wang-style greedy forwarding
+fails before reaching the receiver. Comparison metrics:
+
+```text
+absolute_error = |P_empirical - P~^M|
+relative_error = absolute_error / P_empirical   (when P_empirical > 0)
+```
+
 ## Limitations
 
 - No real Starlink routing policy is known or modeled.
@@ -425,17 +564,51 @@ important for finding bottlenecks.
 
 ## Recommended Run
 
-For a strict, realistic limited-size snapshot from one coherent operational
-shell:
+Research-grade comparison of the BPP analytical model against real Starlink
+TLE snapshots, sampled over roughly one orbital period:
 
 ```bash
-tools/generate_snapshot.sh --n 400 --sample random --seed 1 --starlink_operational
+tools/generate_snapshot.sh --no_live --n 1600 --sample random --seed 1 \
+    --starlink_operational --shell_select largest \
+    --epoch_steps 10 --multi_epoch_seconds 540
+python tools/analyze_mhr_reliability.py --pairs 200 --seed 1
+python tools/plot_mhr_reliability.py
+```
+
+Quick sanity check (single epoch, ~400 satellites, no orbital sweep):
+
+```bash
+tools/generate_snapshot.sh --no_live --n 400 --sample random --seed 1 --starlink_operational
+python tools/analyze_mhr_reliability.py --pairs 100 --seed 1
+python tools/plot_mhr_reliability.py
+```
+
+Optional ns-3 traffic simulation over the same snapshot:
+
+```bash
 tools/run_ns3_snapshot.sh
 python tools/plot_flow_metrics.py
 ```
 
-For exploratory multi-shell runs that may fragment:
+Exploratory multi-shell run that may fragment:
 
 ```bash
 tools/generate_snapshot.sh --n 400 --sample random --seed 1 --starlink_operational --shell_select none --no_strict
 ```
+
+## Limitations Of The Comparison
+
+- The Wang model assumes a homogeneous spherical binomial point process per
+  tier. Real Starlink uses inclined Walker constellations, so the empirical
+  geometry deviates systematically (larger gaps near the equator and seam).
+- The empirical simulator relaxes the direction angle (`theta_r`) and
+  minimum dome angle (`theta_s`) only on uplink/downlink hops, because a
+  ground gateway has every satellite within ~22 degrees of dome and the
+  paper's constraints would forbid every uplink. Hops between satellites
+  use the unrelaxed Wang constraints (c1, c2, c3).
+- The built-in gateways are 10 demo placeholders. For a quantitative study
+  of ground-tier coverage, supply real gateway locations through
+  `--gateways_csv`.
+- The empirical comparison uses geometric forwarding (Wang-style greedy),
+  not the precomputed ISL graph from the snapshot. This is intentional, so
+  that the empirical and analytical models share the same constraint set.
