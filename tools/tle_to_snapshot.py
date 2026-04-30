@@ -501,12 +501,14 @@ def select_shell_population(
     inc_tol_deg: float,
     alt_tol_km: float,
 ) -> tuple[list[tuple[str, str, str]], list[Satrec], dict]:
-    """Optionally reduce the candidate population to one coherent shell.
+    """Optionally reduce the candidate population to one or more coherent shells.
 
     Realistic small experiments should not randomly sample across all
     operational shells. The ISL model is same-shell, so a 400-satellite sample
     spread across many shells is expected to fragment. Selecting the largest
     shell keeps the sample physically coherent while still using real TLEs.
+    Selecting the top two shells enables a meaningful 3-tier experiment:
+    gateway + two substantial satellite shells.
     """
     if mode == "none":
         return list(sats), list(satrecs), {
@@ -515,7 +517,7 @@ def select_shell_population(
             "selected_tles": len(sats),
         }
 
-    if mode != "largest":
+    if mode not in {"largest", "top2"}:
         raise ValueError(f"Unknown shell selection mode: {mode}")
 
     features: list[tuple[int, dict]] = []
@@ -551,7 +553,14 @@ def select_shell_population(
         ),
         reverse=True,
     )
-    chosen = sorted(shell_groups[0])
+    n_select = 1 if mode == "largest" else 2
+    if len(shell_groups) < n_select:
+        raise SystemExit(
+            f"Requested shell selection mode {mode!r}, but only "
+            f"{len(shell_groups)} candidate shells were found.")
+
+    selected_groups = [sorted(g) for g in shell_groups[:n_select]]
+    chosen = [i for g in selected_groups for i in g]
 
     def shell_summary(g: list[int]) -> dict:
         incs = [by_index[i]["inc_deg"] for i in g]
@@ -575,10 +584,118 @@ def select_shell_population(
         "num_candidate_shells": len(shell_groups),
         "inc_tol_deg": inc_tol_deg,
         "alt_tol_km": alt_tol_km,
-        "selected_shell": shell_summary(chosen),
+        "selected_shell": shell_summary(selected_groups[0]),
+        "selected_shells": [shell_summary(g) for g in selected_groups],
+        "selected_group_sizes": [len(g) for g in selected_groups],
         "top_shells": [shell_summary(g) for g in shell_groups[:5]],
     }
     return [sats[i] for i in chosen], [satrecs[i] for i in chosen], meta
+
+
+def sample_selected_population(
+    selected_tles: list[tuple[str, str, str]],
+    selected_srs: list[Satrec],
+    selection_meta: dict,
+    *,
+    n: int,
+    sample_mode: str,
+    seed: Optional[int],
+) -> tuple[list[tuple[str, str, str]], list[Satrec]]:
+    """Sample from a selected population.
+
+    For multi-shell selections (currently `top2`), random sampling is
+    stratified across the selected shell blocks so both shells remain present
+    in the final snapshot and the downstream tier analysis sees a meaningful
+    multi-tier case.
+    """
+    total = min(n, len(selected_tles))
+    if total <= 0:
+        return [], []
+
+    mode = selection_meta.get("mode")
+    group_sizes = list(selection_meta.get("selected_group_sizes", []))
+    if mode == "top2" and len(group_sizes) >= 2:
+        groups: list[list[int]] = []
+        start = 0
+        for sz in group_sizes:
+            groups.append(list(range(start, start + sz)))
+            start += sz
+
+        if sample_mode == "head":
+            counts = []
+            remaining = total
+            for i, sz in enumerate(group_sizes):
+                if i == len(group_sizes) - 1:
+                    take = min(sz, remaining)
+                else:
+                    take = min(sz, max(1, int(round(total * sz / sum(group_sizes)))))
+                    remaining -= take
+                counts.append(take)
+            while sum(counts) > total:
+                for i in range(len(counts)):
+                    if sum(counts) == total:
+                        break
+                    if counts[i] > 1:
+                        counts[i] -= 1
+            while sum(counts) < total:
+                for i, sz in enumerate(group_sizes):
+                    if sum(counts) == total:
+                        break
+                    if counts[i] < sz:
+                        counts[i] += 1
+            idx = []
+            for take, grp in zip(counts, groups):
+                idx.extend(grp[:take])
+        else:
+            rng = np.random.default_rng(seed)
+            exact = [total * sz / sum(group_sizes) for sz in group_sizes]
+            counts = [0] * len(group_sizes)
+            if total >= len(group_sizes):
+                counts = [1] * len(group_sizes)
+            remaining = total - sum(counts)
+            frac_order = sorted(
+                range(len(group_sizes)),
+                key=lambda i: exact[i] - math.floor(exact[i]),
+                reverse=True,
+            )
+            base = [math.floor(v) for v in exact]
+            for i in range(len(group_sizes)):
+                counts[i] += max(0, base[i] - (1 if total >= len(group_sizes) else 0))
+            remaining = total - sum(counts)
+            for i in frac_order:
+                if remaining <= 0:
+                    break
+                if counts[i] < group_sizes[i]:
+                    counts[i] += 1
+                    remaining -= 1
+            while remaining > 0:
+                progressed = False
+                for i, sz in enumerate(group_sizes):
+                    if remaining <= 0:
+                        break
+                    if counts[i] < sz:
+                        counts[i] += 1
+                        remaining -= 1
+                        progressed = True
+                if not progressed:
+                    break
+            idx = []
+            for take, grp in zip(counts, groups):
+                if take <= 0:
+                    continue
+                picked = rng.choice(grp, size=take, replace=False)
+                idx.extend(sorted(int(x) for x in picked.tolist()))
+
+        idx = sorted(idx)
+        return [selected_tles[i] for i in idx], [selected_srs[i] for i in idx]
+
+    if sample_mode == "random":
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(selected_tles), size=total, replace=False)
+        idx = sorted(idx.tolist())
+        return [selected_tles[i] for i in idx], [selected_srs[i] for i in idx]
+
+    return selected_tles[:total], selected_srs[:total]
 
 
 # ---------------------------------------------------------------------------
@@ -929,11 +1046,11 @@ def build_access_links(ground_stations: list[dict],
                        fr: float) -> list[tuple[int, int]]:
     """Add ground-to-satellite access links. Elevation check uses ECEF.
 
-    Access links use their own per-satellite degree budget (max_gs_per_sat)
-    rather than the shared ISL degree cap so that ISL construction order does
-    not crowd out gateway connectivity.
+    Gateway access is limited by physical visibility filters (range and
+    elevation) rather than arbitrary per-gateway or per-satellite caps.
+    The `max_sats_per_gs` / `max_gs_per_sat` parameters are retained in the
+    signature for backward CLI compatibility, but are intentionally ignored.
     """
-    sat_access_degree: dict[int, int] = defaultdict(int)
     added_pairs = []
     for gs in ground_stations:
         candidates = []
@@ -960,19 +1077,10 @@ def build_access_links(ground_stations: list[dict],
                 continue
             candidates.append((dist, elev, s["id"]))
 
-        # Sort by distance, then accept the first `max_sats_per_gs` *valid*
-        # candidates — skipping (not slicing) those blocked by the per-sat cap
-        # or existing edges, so later valid sats are still considered.
+        # Sort by distance and accept every physically valid candidate.
         candidates.sort(key=lambda x: x[0])
         gs_id = gs["id"]
-        added_for_gs = 0
         for dist, elev, sid in candidates:
-            if added_for_gs >= max_sats_per_gs:
-                break
-            if degree[gs_id] >= max_sats_per_gs:
-                break
-            if sat_access_degree[sid] >= max_gs_per_sat:
-                continue
             pair = tuple(sorted((gs_id, sid)))
             if pair in edge_pairs:
                 continue
@@ -986,9 +1094,7 @@ def build_access_links(ground_stations: list[dict],
             })
             degree[gs_id] += 1
             degree[sid] += 1
-            sat_access_degree[sid] += 1
             added_pairs.append(pair)
-            added_for_gs += 1
     return added_pairs
 
 
@@ -1124,13 +1230,15 @@ def parse_args() -> argparse.Namespace:
                          "the earliest launch IDs, which massively over-"
                          "represents a handful of shells and creates "
                          "fragmented topologies for small --n.")
-    ap.add_argument("--shell_select", choices=["largest", "none"],
+    ap.add_argument("--shell_select", choices=["largest", "top2", "none"],
                     default="largest",
                     help="Select a coherent shell before sampling. The "
                          "default 'largest' is the realistic choice for "
                          "limited-size experiments because this project "
-                         "models same-shell ISLs; use 'none' only when you "
-                         "intentionally want a multi-shell population.")
+                         "models same-shell ISLs. Use 'top2' to build a "
+                         "meaningful 3-tier case (gateway + two satellite "
+                         "shells). Use 'none' only when you intentionally "
+                         "want a multi-shell population.")
     ap.add_argument("--seed", type=int, default=None)
 
     # Operational-satellite filters (review: TLE dataset mixes operational,
@@ -1180,7 +1288,7 @@ def parse_args() -> argparse.Namespace:
                     help="CSV with name,lat,lon[,alt_km]. Built-in set used "
                          "if omitted. Pass '' to disable gateways.")
     ap.add_argument("--no_gateways", action="store_true")
-    ap.add_argument("--gs_min_elevation_deg", type=float, default=25.0)
+    ap.add_argument("--gs_min_elevation_deg", type=float, default=5.0)
     ap.add_argument("--gs_max_range_km", type=float, default=2000.0)
     ap.add_argument("--gs_max_sats", type=int, default=4,
                     help="Max satellites per gateway (gateway degree cap).")
@@ -1567,25 +1675,22 @@ def main():
         alt_tol_km=args.alt_tol_km,
     )
     if args.shell_select != "none":
-        sel = shell_selection["selected_shell"]
+        sels = shell_selection.get("selected_shells", [shell_selection["selected_shell"]])
+        desc = "; ".join(
+            "inc "
+            f"{sel['inc_min_deg']}-{sel['inc_max_deg']} deg, "
+            f"perigee alt {sel['perigee_alt_min_km']}-{sel['perigee_alt_max_km']} km, "
+            f"count={sel['count']}"
+            for sel in sels
+        )
         print(
             "Shell selection kept "
             f"{shell_selection['selected_tles']}/{shell_selection['input_tles']} "
-            "post-filter TLEs "
-            f"(inc {sel['inc_min_deg']}-{sel['inc_max_deg']} deg, "
-            f"perigee alt {sel['perigee_alt_min_km']}-"
-            f"{sel['perigee_alt_max_km']} km).")
+            f"post-filter TLEs across {len(sels)} shell(s): {desc}.")
 
-    if args.sample == "random":
-        rng = np.random.default_rng(args.seed)
-        idx = rng.choice(len(shell_tles),
-                         size=min(args.n, len(shell_tles)),
-                         replace=False)
-        raw_sats = [shell_tles[i] for i in sorted(idx.tolist())]
-        satrecs = [shell_srs[i] for i in sorted(idx.tolist())]
-    else:
-        raw_sats = shell_tles[:args.n]
-        satrecs = shell_srs[:args.n]
+    raw_sats, satrecs = sample_selected_population(
+        shell_tles, shell_srs, shell_selection,
+        n=args.n, sample_mode=args.sample, seed=args.seed)
 
     jd, fr, epoch_mode = resolve_common_epoch(args, satrecs)
     if epoch_mode == "per-tle-epoch":

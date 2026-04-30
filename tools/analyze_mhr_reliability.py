@@ -134,8 +134,62 @@ def has_line_of_sight(p: np.ndarray, q: np.ndarray,
 # Tier / shell inference
 # ---------------------------------------------------------------------------
 
+def _merge_satellite_groups(groups: List[Dict],
+                            max_satellite_tiers: int) -> List[Dict]:
+    """Merge accidental shell splits back into the dominant satellite tiers.
+
+    Real TLE-derived snapshots can re-cluster a selected shell into small
+    fragments across epochs. For this project we want a stable
+    gateway + two-satellite-tier experiment, so retain the largest satellite
+    groups and merge every extra fragment into the nearest retained tier by
+    mean altitude.
+    """
+    if len(groups) <= max_satellite_tiers:
+        return sorted(groups, key=lambda g: g["altitude_km"])
+
+    ranked = sorted(
+        enumerate(groups),
+        key=lambda item: (-item[1]["N"], item[1]["altitude_km"], item[1]["shell_id"]),
+    )
+    dominant_indices = {idx for idx, _ in ranked[:max_satellite_tiers]}
+    dominant = [groups[idx] for idx in sorted(dominant_indices)]
+    dominant = [
+        {
+            "name": g["name"],
+            "kind": g["kind"],
+            "shell_id": g["shell_id"],
+            "altitude_km": g["altitude_km"],
+            "R_km": g["R_km"],
+            "N": g["N"],
+            "node_ids": list(g["node_ids"]),
+        }
+        for g in dominant
+    ]
+
+    dominant.sort(key=lambda g: g["altitude_km"])
+
+    for idx, g in enumerate(groups):
+        if idx in dominant_indices:
+            continue
+        nearest = min(
+            dominant,
+            key=lambda d: abs(g["altitude_km"] - d["altitude_km"]),
+        )
+        nearest["node_ids"].extend(g["node_ids"])
+        total = nearest["N"] + g["N"]
+        nearest["altitude_km"] = (
+            nearest["altitude_km"] * nearest["N"] + g["altitude_km"] * g["N"]
+        ) / total
+        nearest["R_km"] = R_EARTH_KM + nearest["altitude_km"]
+        nearest["N"] = total
+
+    dominant.sort(key=lambda g: g["altitude_km"])
+    return dominant
+
+
 def infer_tiers(nodes: pd.DataFrame,
-                alt_bin_km: float = 30.0) -> List[Dict]:
+                alt_bin_km: float = 30.0,
+                max_satellite_tiers: int = 2) -> List[Dict]:
     """Group snapshot nodes into Wang-style tiers.
 
     Tier 1 is gateways (kind == 'gateway') if any are present. Satellite
@@ -161,6 +215,8 @@ def infer_tiers(nodes: pd.DataFrame,
     if sats.empty:
         return tiers
 
+    satellite_groups: List[Dict] = []
+
     if (sats["shell_id"] >= 0).any() and sats["shell_id"].nunique() >= 1:
         groups = []
         for sid, df in sats.groupby("shell_id"):
@@ -170,7 +226,7 @@ def infer_tiers(nodes: pd.DataFrame,
             groups.append((float(df["altitude_km"].mean()), int(sid), df))
         groups.sort(key=lambda t: t[0])
         for mean_alt, sid, df in groups:
-            tiers.append({
+            satellite_groups.append({
                 "name": f"sat_shell_{sid}",
                 "kind": "satellite",
                 "shell_id": sid,
@@ -189,7 +245,7 @@ def infer_tiers(nodes: pd.DataFrame,
         idx = np.clip(np.searchsorted(edges, alt, side="right") - 1, 0, nbins - 1)
         sats = sats.assign(_bin=idx)
         for b, df in sats.groupby("_bin"):
-            tiers.append({
+            satellite_groups.append({
                 "name": f"sat_alt_{b}",
                 "kind": "satellite",
                 "shell_id": -1,
@@ -198,7 +254,10 @@ def infer_tiers(nodes: pd.DataFrame,
                 "N": int(len(df)),
                 "node_ids": df["id"].tolist(),
             })
-        tiers.sort(key=lambda t: t["altitude_km"] if t["kind"] == "satellite" else -1.0)
+
+    satellite_groups = _merge_satellite_groups(
+        satellite_groups, max_satellite_tiers=max_satellite_tiers)
+    tiers.extend(satellite_groups)
 
     # Re-index the gateway-first ordering. Wang uses tier 1 = ground.
     tiers.sort(key=lambda t: (t["kind"] != "gateway", t["altitude_km"]))
@@ -568,7 +627,6 @@ def simulate_route(node_arr: Dict,
     norms = node_arr["norms"]
     id_to_idx = node_arr["id_to_idx"]
     kinds = node_arr["kinds"]
-
     if src_id not in id_to_idx or dst_id not in id_to_idx:
         return {
             "success": False, "interrupt": False, "hops": 0,
@@ -610,19 +668,21 @@ def simulate_route(node_arr: Dict,
         # Cheap pre-filter on distance to avoid expensive LoS checks for
         # everything in the snapshot.
         candidate_idxs = np.where((dists > 0.0) & (dists <= d_th_km))[0]
-        # Relax theta_s on uplink/downlink: a ground gateway has no useful
-        # geographic progress threshold to a satellite directly overhead.
-        cur_is_ground = (kinds[current_idx] == "gateway")
         for cand_idx in candidate_idxs:
             if cand_idx == current_idx or cand_idx == dst_idx or cand_idx in visited:
                 continue
+            cur_is_ground = (kinds[current_idx] == "gateway")
             cand_is_ground = (kinds[cand_idx] == "gateway")
-            relax = cur_is_ground or cand_is_ground
+            relax_gateway_hop = cur_is_ground or cand_is_ground
             ok, dome_to_rx = candidate_constraints_ok(
                 cur_pos, cur_norm, pos[cand_idx], norms[cand_idx],
                 receiver_pos, theta_r, theta_s, d_th_km,
-                enforce_min_dome=not relax,
-                enforce_direction=not relax)
+                # Gateway hops are kept practical rather than fully paper-
+                # strict: c3 still applies, while c1/c2 are enforced for
+                # satellite-to-satellite progress where the Wang-style relay
+                # geometry is most meaningful.
+                enforce_min_dome=not relax_gateway_hop,
+                enforce_direction=not relax_gateway_hop)
             if not ok:
                 continue
             cand_id = node_arr["ids"][cand_idx]
@@ -660,13 +720,18 @@ def simulate_route(node_arr: Dict,
 
 def sample_pairs(nodes: pd.DataFrame, tiers: List[Dict],
                  num_pairs: int, theta_m_min: float,
+                 theta_m_target: float,
                  rng: random.Random,
                  endpoint_kind: str = "auto"
                  ) -> List[Tuple[str, str, float]]:
     """Pick `num_pairs` (src, dst, theta_m_pair) triples with dome
-    angle >= theta_m_min. Returns the actual observed dome angle so the
-    analytical model can be evaluated at the empirically realised theta_m
-    instead of the user-supplied target."""
+    angle >= theta_m_min.
+
+    When the endpoint pool is small (typical for gateway-based experiments),
+    rank all candidate pairs by closeness to `theta_m_target` so the sampled
+    pairs align better with the paper-style transmitter/receiver separation.
+    Returns the actual observed dome angle for each selected pair.
+    """
     has_gateway = any(t["kind"] == "gateway" for t in tiers)
     if endpoint_kind == "auto":
         kind = "gateway" if has_gateway else "satellite"
@@ -685,10 +750,28 @@ def sample_pairs(nodes: pd.DataFrame, tiers: List[Dict],
                     pool["eci_z_km"].values], axis=1)
     norms = np.linalg.norm(pos, axis=1)
 
+    # For small endpoint pools (e.g. gateways), evaluate all candidate pairs
+    # and prefer those closest to the paper-style theta_m target.
+    if len(pool) <= 256:
+        candidates: List[Tuple[float, float, int, int]] = []
+        for i in range(len(pool)):
+            for j in range(i + 1, len(pool)):
+                cos_d = float(np.dot(pos[i], pos[j])) / (norms[i] * norms[j])
+                cos_d = max(-1.0, min(1.0, cos_d))
+                dome = math.acos(cos_d)
+                if dome + 1e-9 < theta_m_min:
+                    continue
+                candidates.append((abs(dome - theta_m_target), -dome, i, j))
+        candidates.sort()
+        out: List[Tuple[str, str, float]] = []
+        for _, neg_dome, i, j in candidates[:num_pairs]:
+            out.append((pool["id"].iloc[i], pool["id"].iloc[j], -neg_dome))
+        return out
+
     pairs: List[Tuple[str, str, float]] = []
     seen = set()
     attempts = 0
-    max_attempts = max(2000, num_pairs * 50)
+    max_attempts = max(2000, num_pairs * 100)
     while len(pairs) < num_pairs and attempts < max_attempts:
         attempts += 1
         i = rng.randrange(len(pool))
@@ -705,7 +788,9 @@ def sample_pairs(nodes: pd.DataFrame, tiers: List[Dict],
             continue
         seen.add(key)
         pairs.append((pool["id"].iloc[i], pool["id"].iloc[j], dome))
-    return pairs
+
+    pairs.sort(key=lambda x: (abs(x[2] - theta_m_target), -x[2]))
+    return pairs[:num_pairs]
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +851,7 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
     node_arr = precompute_node_arrays(nodes)
     node_to_tier = build_node_to_tier(nodes, tiers)
     pairs = sample_pairs(nodes, tiers, args.pairs, args.theta_m_min,
+                         args.theta_m,
                          rng, args.endpoint_kind)
 
     epoch_label = (meta_step or {}).get("iso") or "unknown"
@@ -906,11 +992,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                           "default pi/3 keeps pairs reasonably distant given a "
                           "small gateway list."))
     ap.add_argument("--theta_m_mode", choices=("observed", "fixed"),
-                    default="observed",
+                    default="fixed",
                     help=("how to set the theta_m used in the analytical model. "
                           "'observed' uses the mean dome angle of sampled pairs "
                           "(makes the analytical / empirical comparison "
-                          "apples-to-apples). 'fixed' uses --theta_m verbatim."))
+                          "apples-to-apples). 'fixed' uses --theta_m verbatim "
+                          "(default, aligns with the paper's theta_m = pi case)."))
     ap.add_argument("--d_th_km", type=float, default=DEFAULT_D_TH_KM,
                     help="max single-hop reliable distance (km). default 4000.")
     ap.add_argument("--pairs", type=int, default=200,

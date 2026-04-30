@@ -7,6 +7,15 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 port="${1:-8000}"
 
+if command -v python >/dev/null 2>&1; then
+  python_bin="python"
+elif command -v python3 >/dev/null 2>&1; then
+  python_bin="python3"
+else
+  echo "Python not found. Install python3 or add python to PATH." >&2
+  exit 1
+fi
+
 if [[ ! -f "${repo_root}/results/snapshot_nodes.csv" ]]; then
   echo "No snapshot CSVs in ${repo_root}/results/." >&2
   echo "Run tools/generate_snapshot.sh first." >&2
@@ -15,4 +24,4 @@ fi
 
 echo "Serving ${repo_root} at http://localhost:${port}/"
 echo "Open http://localhost:${port}/tools/visualizer/ in your browser."
-exec python -m http.server "${port}" --bind 127.0.0.1 --directory "${repo_root}"
+exec "${python_bin}" -m http.server "${port}" --bind 127.0.0.1 --directory "${repo_root}"

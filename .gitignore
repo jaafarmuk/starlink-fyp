@@ -7,3 +7,6 @@ __pycache__/
 build/
 cmake-cache/
 .DS_Store
+results/*
+!results/.gitkeep
+!results/README.md

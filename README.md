@@ -1,9 +1,17 @@
 # Starlink FYP: Multi-tier LEO Reliability vs. Real Starlink TLE Snapshots
 
-This project compares the analytical multi-hop interruption probability from
-Wang, Kishk, and Alouini (arXiv:2303.02286, 2023) against empirical multi-hop
-routing measured on real Starlink TLE snapshots. The accompanying ns-3 TCP
-simulation and Three.js visualizer are kept as supporting tooling.
+This project studies one main question:
+
+> How well does the analytical multi-hop interruption model from
+> Wang, Kishk, and Alouini (2023) match routing reliability measured on
+> Starlink TLE-derived snapshots?
+
+Everything else in the repo supports that pipeline:
+
+1. Generate one or more Starlink topology snapshots from TLEs.
+2. Run the Wang-style analytical vs empirical reliability comparison.
+3. Optionally run ns-3 TCP traffic on the same snapshot.
+4. Optionally inspect the topology in the browser visualizer.
 
 The project is not a reverse-engineered model of the real Starlink production
 network. Real Starlink ISL scheduling, gateway/PoP choices, beam assignment,
@@ -11,13 +19,45 @@ capacity sharing, and routing policies are proprietary. The built-in gateways
 are clearly labelled `GW-DEMO-*` and are demo placeholders. Public TLEs plus
 documented geometric assumptions are the only inputs.
 
+## Quick Start
+
+From the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Run the core pipeline:
+
+```bash
+tools/generate_snapshot.sh --n 400 --sample random --seed 1 --starlink_operational
+python tools/analyze_mhr_reliability.py --pairs 200 --seed 1
+python tools/plot_mhr_reliability.py
+```
+
+Optional follow-up steps:
+
+```bash
+tools/run_ns3_snapshot.sh
+tools/run_visualizer.sh
+```
+
+Open the visualizer at:
+
+```text
+http://localhost:8000/tools/visualizer/
+```
+
+## Repository Layout
+
+- `datasets/`: input TLE data.
+- `tools/`: Python and shell entrypoints for generation, analysis, plotting, and serving.
+- `src/`: the ns-3 scenario source.
+- `results/`: local generated outputs. This directory is a workspace, not a source folder.
+
 ## Research Contribution
-
-The research question is:
-
-> How well does the BPP analytical interruption-probability model from
-> Wang et al. (2023) predict empirical multi-hop routing reliability on
-> real Starlink TLE snapshots?
 
 The pipeline answers this in four steps:
 

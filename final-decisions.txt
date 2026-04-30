@@ -1,0 +1,47 @@
+1. Main target paper:
+   Reliability Analysis of Multi-hop Routing in Multi-tier LEO Satellite Networks.
+
+2. Main project direction:
+   The project should be a paper-specific extension, not a broad study of all stochastic-geometry LEO routing papers.
+
+3. Main research question:
+   How accurate is the paper's interruption-probability model when tested on real satellite geometry rather than the idealized BPP model?
+
+4. Stronger contribution angle:
+   The project should not stop at plain validation. It should evaluate the paper on real Starlink TLE-derived snapshots and identify when the analytical model works well and when it breaks down.
+
+5. Core project story:
+   The project should focus on comparing the paper's analytical interruption-probability model against empirical results measured on real Starlink TLE-derived multi-epoch snapshots.
+
+6. Main contribution:
+   The core contribution is the analytical-versus-empirical interruption-probability comparison on real TLE-derived geometry, together with characterizing the validity boundary of the model.
+
+7. Supporting tools:
+   The ns-3 simulation and the visualizer are supporting tools, not the central research contribution.
+
+8. Scope control:
+   Not every computed output in the repo needs to be part of the main contribution.
+
+9. Primary evaluation metrics:
+   Absolute error and relative error are both primary metrics for comparing analytical and empirical interruption probability.
+
+10. Secondary evaluation metric:
+   Strategy ranking correctness is a secondary metric for checking whether the model still identifies the better routing strategy correctly.
+
+11. Interpretation of metrics:
+   Relative error alone is not enough, and absolute error alone is not enough, so both should be used together.
+
+12. Framing of the project:
+   The project should be presented as an extension of the target paper under real TLE-derived geometry, not as a claim that it exactly models the real internal Starlink production network.
+
+13. Constraint alignment with the paper:
+   The core routing constraints should stay the same as, or very close to, the paper's values, especially c1, c2, and c3.
+
+14. Population-size alignment with the paper:
+   The satellite population size should stay reasonably close to the paper's scale rather than using a much smaller toy setup.
+
+15. Main intended difference from the paper:
+   The main difference should be the geometry source: TLE-derived real snapshot geometry instead of the paper's idealized BPP geometry.
+
+16. Multi-tier requirement:
+   The experiment should use a meaningful multi-tier setup rather than an accidental tiny leftover shell that only appears as a technical artifact.
