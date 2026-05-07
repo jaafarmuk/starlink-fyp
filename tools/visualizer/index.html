@@ -132,36 +132,26 @@
     <!-- 1. Title -->
     <div class="section" style="padding-bottom:10px">
       <h1>Starlink MHR Visualizer</h1>
-      <div class="muted" style="font-size:10px;margin-top:2px">
-        Multi-Hop Routing &middot; BPP constraints &middot; 3D ECEF &middot; Real TLE data
-      </div>
     </div>
 
-    <!-- 2. Snapshot + Epoch -->
+    <!-- 2. Snapshot -->
     <div class="section">
       <h2>Snapshot</h2>
       <div id="meta-info" class="muted" style="margin-bottom:8px">loading&hellip;</div>
       <label>Satellite count (performance vs. accuracy)</label>
       <select id="sat-count-select" style="margin-bottom:6px">
-        <option value="200">200 satellites — fastest</option>
-        <option value="600">600 satellites — fast (matches early experiment)</option>
-        <option value="1500">1500 satellites — medium</option>
+        <option value="500">500 satellites — fastest</option>
+        <option value="1000">1000 satellites — fast</option>
+        <option value="2000">2000 satellites — medium</option>
         <option value="0" selected>All 4080 satellites — full real dataset</option>
       </select>
       <div class="muted" style="font-size:10px;margin-bottom:7px">
         Lower counts subsample randomly — faster rendering but partially destroys
         Walker-delta lane structure, making BPP predictions less accurate.
       </div>
-      <label>Time window (epoch)</label>
-      <select id="epoch-select" style="margin-bottom:4px"></select>
       <div class="muted" style="font-size:10px;margin-bottom:7px">
-        Satellites move between epochs (9-min steps). Switch to reload ISL topology.
+        Fixed frozen-time topology. Snapshot date/time is shown above.
       </div>
-      <button class="secondary" id="file-load-btn"
-              onclick="document.getElementById('file-input').click()">
-        Load local CSVs&hellip;
-      </button>
-      <input type="file" id="file-input" multiple accept=".csv,.json" />
     </div>
 
     <!-- 3. Route -->
@@ -173,12 +163,14 @@
         <button id="locate-src" class="secondary" title="Fly to source"
                 style="width:auto;padding:4px 8px">&#9737;</button>
       </div>
+      <div id="src-location" style="font-size:10px;color:var(--accent-2);margin-top:2px;min-height:14px;padding-left:2px"></div>
       <label>Destination</label>
       <div style="display:grid;grid-template-columns:1fr auto;gap:5px">
         <select id="dst-select"></select>
         <button id="locate-dst" class="secondary" title="Fly to destination"
                 style="width:auto;padding:4px 8px">&#9737;</button>
       </div>
+      <div id="dst-location" style="font-size:10px;color:var(--warn);margin-top:2px;min-height:14px;padding-left:2px"></div>
       <div class="row" style="margin-top:8px">
         <button id="pick-src" class="secondary">Pick on globe (src)</button>
         <button id="pick-dst" class="secondary">Pick on globe (dst)</button>
@@ -201,9 +193,36 @@
       </div>
     </div>
 
+    <!-- 4b. Background traffic -->
+    <div class="section">
+      <div class="section-title-row" style="margin-bottom:6px">
+        <h2 style="margin:0">Background traffic</h2>
+        <label style="display:flex;align-items:center;gap:5px;color:var(--ink);
+                       font-size:11px;margin:0;cursor:pointer">
+          <input type="checkbox" id="traffic-on" style="width:auto;margin:0" />
+          <span>ON</span>
+        </label>
+      </div>
+      <label>Intensity</label>
+      <select id="traffic-intensity" style="margin-bottom:5px">
+        <option value="low">Low</option>
+        <option value="medium" selected>Medium</option>
+        <option value="high">High</option>
+        <option value="stress">Stress</option>
+        <option value="custom">Custom…</option>
+      </select>
+      <div id="traffic-custom-row" style="display:none">
+        <label>Spawn rate (pkt/s)</label>
+        <div class="slider-row">
+          <input type="range" id="traffic-rate" min="1" max="80" step="1" value="10" />
+          <span class="slider-val" id="traffic-rate-val">10/s</span>
+        </div>
+      </div>
+    </div>
+
     <!-- 5. Traffic model -->
     <div class="section">
-      <h2>Traffic model</h2>
+      <h2>Packet model</h2>
       <div class="row">
         <div>
           <label>Packet size (B)</label>
@@ -211,7 +230,18 @@
         </div>
         <div>
           <label>Link rate (Mbps)</label>
-          <input id="link-rate" type="number" min="1" max="100000" step="1" value="20" />
+          <input id="link-rate" type="number" min="1" max="100000" step="1" value="100" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <div>
+          <label>GW access (Mbps)</label>
+          <input id="gateway-rate" type="number" min="1" max="100000" step="1" value="25"
+            title="Gateway access link capacity (Mbps). Lower than ISL trunks — gateways are the bottleneck." />
+        </div>
+        <div>
+          <label>Loss prob / link</label>
+          <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0" />
         </div>
       </div>
       <div class="row" style="margin-top:4px">
@@ -220,14 +250,6 @@
           <input id="offered-load" type="number" min="0" max="100000" step="0.1" value="0"
             title="Background traffic sets ρ and M/D/1 queuing delay. 0 = no queuing." />
         </div>
-        <div>
-          <label>Loss prob / link</label>
-          <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0" />
-        </div>
-      </div>
-      <div class="muted" style="font-size:10px;margin-top:4px">
-        Queuing model: M/D/1 &middot; &rho;&nbsp;=&nbsp;load/rate &middot;
-        W<sub>q</sub>&nbsp;=&nbsp;&rho;/(2(1&minus;&rho;))&times;T<sub>s</sub>
       </div>
     </div>
 
@@ -299,9 +321,10 @@
       <div id="compare-results"></div>
     </div>
 
-    <!-- 11. Session stats -->
+    <!-- 11. Live dashboard -->
     <div class="section">
-      <h2>Session Stats</h2>
+      <h2>Live Dashboard</h2>
+      <div id="live-traffic" class="muted" style="margin-bottom:6px"></div>
       <div id="metrics" class="muted"></div>
       <div class="heat-legend" style="margin-top:6px">
         <span>Link heat:</span>

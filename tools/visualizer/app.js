@@ -23,9 +23,10 @@
 //   Edges are recolored after each packet: blue→cyan→amber→red by load count.
 //   Matches "empirical interruption probability" concept from the research.
 //
-// Multi-epoch:
-//   10 topology snapshots (snap_optA, t1–t9) each 9 minutes apart.
-//   Switching epoch reloads satellite positions + ISL graph.
+// Snapshot:
+//   The visualizer uses one frozen-time topology by default. Additional
+//   epoch files are kept as data sources, but the UI no longer exposes
+//   epoch switching so the simulation remains fixed and comparable.
 //
 // ===========================================================================
 
@@ -59,13 +60,22 @@ const EPOCH_EDGES_URLS = [
 ];
 const META_URL = '../../results/snap_optA_meta.json';
 
-const EPOCH_LABELS = [
-  'Epoch 0 — 21:30 UTC  (base)', 'Epoch 1 — 21:39 UTC  (+9 min)',
-  'Epoch 2 — 21:48 UTC  (+18 min)', 'Epoch 3 — 21:57 UTC  (+27 min)',
-  'Epoch 4 — 22:06 UTC  (+36 min)', 'Epoch 5 — 22:15 UTC  (+45 min)',
-  'Epoch 6 — 22:24 UTC  (+54 min)', 'Epoch 7 — 22:33 UTC  (+63 min)',
-  'Epoch 8 — 22:42 UTC  (+72 min)', 'Epoch 9 — 22:51 UTC  (+81 min)',
-];
+function formatSnapshotTime(iso) {
+  if (!iso) return 'unknown snapshot time';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZone: 'UTC',
+    timeZoneName: 'short',
+  }).format(d);
+}
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -116,6 +126,14 @@ const state = {
   bppDelivered:     0,
   dijkstraSent:     0,
   dijkstraDelivered: 0,
+  dijkstraTotalMs:     0.0,
+  dijkstraTotalPropMs: 0.0,
+  dijkstraTotalQueueMs:0.0,
+  dijkstraTotalHops:   0,
+  bppTotalMs:          0.0,
+  bppTotalPropMs:      0.0,
+  bppTotalQueueMs:     0.0,
+  bppTotalHops:        0,
 
   // Current path
   currentPath:   null,
@@ -127,6 +145,34 @@ const state = {
 
   // Comparison orchestration
   compareQueue: null,
+
+  // Background traffic engine
+  traffic: {
+    on:        false,
+    intensity: 'medium',           // 'low' | 'medium' | 'high' | 'stress' | 'custom'
+    customRate: 35,                // pkt/s if custom
+    demandMultiplier: 600,         // amplifies rendered traffic to simulated offered load
+    flows:     [],                 // active rendered flows
+    spawnAcc:  0,
+    nextFlowId: 1,
+    sentTotal:      0,
+    deliveredTotal: 0,
+    lostTotal:      0,
+    activeCap:      180,           // max simultaneous in-flight rendered flows
+    // Sliding-window history of recently delivered flows for accurate metrics
+    history:        [],            // [{ e2eMs, propMs, queueMs, serMs, hops, packetBits, deliveredAt }]
+    historyMax:     400,
+    // Aggregate "real demand" stats — count includes demand multiplier
+    simSent:        0,
+    simDelivered:   0,
+    simLost:        0,
+    simBitsDelivered: 0,
+  },
+
+  // Per-edge live state
+  edgeLoad:        null,     // Float32Array per edge (0..1) — derived from edgeRecentBits
+  edgeRecentBits:  null,     // Float32Array — EMA accumulator of offered bits (last τ seconds)
+  edgeIsAccess:    null,     // Uint8Array — 1 if edge is gateway access link, 0 otherwise
 };
 
 // Precomputed flat position arrays for fast BPP scanning
@@ -137,12 +183,98 @@ let NPZ = new Float64Array(0);  // scene Z per node
 let NODE_KIND = [];             // 'gateway' | 'satellite' per node
 
 // ---------------------------------------------------------------------------
+// Location / reverse-geocoding (Nominatim)
+// ---------------------------------------------------------------------------
+
+const locationCache = {};
+
+async function getNodeLocation(node) {
+  if (!node) return '';
+  const key = `${node.lat.toFixed(1)},${node.lon.toFixed(1)}`;
+  if (locationCache[key] !== undefined) return locationCache[key];
+  locationCache[key] = '';  // prevent duplicate requests
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${node.lat}&lon=${node.lon}&format=json&zoom=3&accept-language=en`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'StarlinkMHRVisualizer/1.0' } });
+    if (!r.ok) return '';
+    const data = await r.json();
+    const country = data.address?.country || '';
+    locationCache[key] = country;
+    return country;
+  } catch (_) { return ''; }
+}
+
+// Try to extract a country name from gateway names like "GW-Aerzen - Germany"
+// or "Aerzen, Germany" or trailing parenthesized country.
+function inferCountryFromName(name) {
+  if (!name) return '';
+  // Pattern: "... - Country" or "..., Country" or "... (Country)"
+  const m = name.match(/[-–—]\s*([A-Za-z][A-Za-z\s]+)$/) ||
+            name.match(/,\s*([A-Za-z][A-Za-z\s]+)$/) ||
+            name.match(/\(([A-Za-z][A-Za-z\s]+)\)\s*$/);
+  if (m) return m[1].trim();
+  return '';
+}
+
+function showNodeLocation(node, el) {
+  if (!node || !el) return;
+  if (node.kind === 'gateway') {
+    // First try to infer from name (free, instant)
+    const inferred = inferCountryFromName(node.name);
+    if (inferred) {
+      el.textContent = `📍 ${inferred}`;
+      return;
+    }
+    // Fall back to Nominatim reverse geocoding
+    el.textContent = '⟳ locating…';
+    getNodeLocation(node).then(c => {
+      if (el) el.textContent = c ? `📍 ${c}` : `${node.lat.toFixed(1)}°, ${node.lon.toFixed(1)}°`;
+    });
+  } else {
+    el.textContent = `🛰  shell ${node.shellId} · plane ${node.planeId} · ${node.lat.toFixed(1)}°,${node.lon.toFixed(1)}°`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gateway link cap (~5 closest access links per gateway)
+// ---------------------------------------------------------------------------
+
+function capGatewayLinks(edgesRows, nodesRows, maxLinks) {
+  const kindMap = {};
+  for (const r of nodesRows) kindMap[r.id] = r.kind;
+
+  const gwEdgeMap = {};
+  const otherEdges = [];
+
+  for (const e of edgesRows) {
+    const uGw = kindMap[e.u] === 'gateway';
+    const vGw = kindMap[e.v] === 'gateway';
+    if (uGw || vGw) {
+      const gwId = uGw ? e.u : e.v;
+      if (!gwEdgeMap[gwId]) gwEdgeMap[gwId] = [];
+      gwEdgeMap[gwId].push(e);
+    } else {
+      otherEdges.push(e);
+    }
+  }
+
+  const cappedGw = [];
+  for (const edges of Object.values(gwEdgeMap)) {
+    const sorted = edges.slice().sort((a, b) => Number(a.distance_km) - Number(b.distance_km));
+    cappedGw.push(...sorted.slice(0, maxLinks));
+  }
+  return [...otherEdges, ...cappedGw];
+}
+
+// ---------------------------------------------------------------------------
 // UI element references
 // ---------------------------------------------------------------------------
 
 const ui = {
   src:            document.getElementById('src-select'),
   dst:            document.getElementById('dst-select'),
+  srcLocation:    document.getElementById('src-location'),
+  dstLocation:    document.getElementById('dst-location'),
   pickSrc:        document.getElementById('pick-src'),
   pickDst:        document.getElementById('pick-dst'),
   locateSrc:      document.getElementById('locate-src'),
@@ -155,6 +287,7 @@ const ui = {
   packetSize:     document.getElementById('packet-size'),
   linkRate:       document.getElementById('link-rate'),
   offeredLoad:    document.getElementById('offered-load'),
+  gatewayRate:    document.getElementById('gateway-rate'),
   lossProb:       document.getElementById('loss-probability'),
   launch:         document.getElementById('launch'),
   launchBurst:    document.getElementById('launch-burst'),
@@ -164,12 +297,17 @@ const ui = {
   metaInfo:       document.getElementById('meta-info'),
   pathInfo:       document.getElementById('path-info'),
   metrics:        document.getElementById('metrics'),
+  liveTraffic:    document.getElementById('live-traffic'),
+  trafficOn:      document.getElementById('traffic-on'),
+  trafficIntensity: document.getElementById('traffic-intensity'),
+  trafficCustomRow: document.getElementById('traffic-custom-row'),
+  trafficRate:    document.getElementById('traffic-rate'),
+  trafficRateVal: document.getElementById('traffic-rate-val'),
   status:         document.getElementById('status'),
   tooltip:        document.getElementById('tooltip'),
   pathOverlay:    document.getElementById('path-overlay'),
   scene:          document.getElementById('scene'),
   fileInput:      document.getElementById('file-input'),
-  epochSelect:    document.getElementById('epoch-select'),
   satCountSelect: document.getElementById('sat-count-select'),
   compareSection: document.getElementById('compare-section'),
   compareResults: document.getElementById('compare-results'),
@@ -258,6 +396,9 @@ function initScene() {
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true; controls.dampingFactor = 0.08;
   controls.minDistance = 8; controls.maxDistance = 200;
+  // Allow nearly-free vertical rotation — past the poles
+  controls.minPolarAngle = -Infinity;
+  controls.maxPolarAngle =  Infinity;
   ambientLight = new THREE.AmbientLight(0x404060, 1.5); scene.add(ambientLight);
   sunLight = new THREE.DirectionalLight(0xffffff, 1.0);
   sunLight.position.set(50, 20, 30); scene.add(sunLight);
@@ -393,52 +534,146 @@ function edgeColorByLoad(edgeIdx) {
   return 0xff6a6a;                      // red — heavy
 }
 
+// ── Batched edge rendering ────────────────────────────────────────────────
+// Single LineSegments draw call for ALL edges. Vertex-color updates drive
+// congestion heat. Massive perf win vs per-edge THREE.Line.
+let edgeBatch = null;        // THREE.LineSegments
+let edgeBatchColors = null;  // Float32Array — vertex colors (rgb per vertex)
+let edgeBatchBaseRGB = null; // Float32Array — base color per edge
+
+// ── Instanced satellite rendering ────────────────────────────────────────
+let satInstanced = null;     // THREE.InstancedMesh — all satellites
+let satInstanceToNodeId = []; // instanceIndex → nodeId
+let nodeIdToSatInstance = []; // nodeId → instanceIndex (-1 if gateway)
+
+const _tmpMat = new THREE.Matrix4();
+const _tmpColor = new THREE.Color();
+
 function addSceneObjects() {
-  for (let i = 0; i < state.edges.length; ++i) {
+  // ── Batched edges ───────────────────────────────────────────────────
+  const E = state.edges.length;
+  const positions = new Float32Array(E * 6);    // 2 verts × 3
+  edgeBatchColors  = new Float32Array(E * 6);   // 2 verts × 3 (rgb)
+  edgeBatchBaseRGB = new Float32Array(E * 3);   // 1 rgb per edge
+  for (let i = 0; i < E; ++i) {
     const e = state.edges[i];
     const a = vec3OfNode(state.nodes[e.u]);
     const b = vec3OfNode(state.nodes[e.v]);
-    const geo = new THREE.BufferGeometry().setFromPoints([a, b]);
-    const baseCol = EDGE_BASE_COLORS[e.kind] || EDGE_BASE_COLORS.unknown;
-    const mat = new THREE.LineBasicMaterial({ color: baseCol, transparent: true, opacity: 0.35 });
-    const line = new THREE.Line(geo, mat);
-    line.userData.edgeIndex = i;
-    line.userData.baseColor = baseCol;
-    state.renderEdges.push(line);
-    scene.add(line);
+    positions[i * 6 + 0] = a.x; positions[i * 6 + 1] = a.y; positions[i * 6 + 2] = a.z;
+    positions[i * 6 + 3] = b.x; positions[i * 6 + 4] = b.y; positions[i * 6 + 5] = b.z;
+    const baseHex = EDGE_BASE_COLORS[e.kind] || EDGE_BASE_COLORS.unknown;
+    _tmpColor.setHex(baseHex);
+    edgeBatchBaseRGB[i * 3 + 0] = _tmpColor.r;
+    edgeBatchBaseRGB[i * 3 + 1] = _tmpColor.g;
+    edgeBatchBaseRGB[i * 3 + 2] = _tmpColor.b;
+    // start at base color
+    for (let k = 0; k < 2; ++k) {
+      edgeBatchColors[i * 6 + k * 3 + 0] = _tmpColor.r;
+      edgeBatchColors[i * 6 + k * 3 + 1] = _tmpColor.g;
+      edgeBatchColors[i * 6 + k * 3 + 2] = _tmpColor.b;
+    }
   }
+  const eg = new THREE.BufferGeometry();
+  eg.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  eg.setAttribute('color',    new THREE.BufferAttribute(edgeBatchColors, 3));
+  edgeBatch = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({
+    vertexColors: true, transparent: true, opacity: 0.45,
+  }));
+  scene.add(edgeBatch);
+
+  state.edgeLoad       = new Float32Array(E);
+  state.edgeRecentBits = new Float32Array(E);
+  state.edgeIsAccess   = new Uint8Array(E);
+  for (let i = 0; i < E; i++) {
+    state.edgeIsAccess[i] = state.edges[i].kind === 'access' ? 1 : 0;
+  }
+
+  // ── Nodes: gateways individual, satellites instanced ───────────────
+  satInstanceToNodeId = [];
+  nodeIdToSatInstance = new Array(state.nodes.length).fill(-1);
+
+  const sats = [];
   for (const n of state.nodes) {
-    const isGw = n.kind === 'gateway';
-    const geo  = new THREE.SphereGeometry(isGw ? 0.12 : 0.065, 12, 12);
-    const mat  = new THREE.MeshBasicMaterial({ color: isGw ? 0xff4763 : 0x8affc1 });
-    const m    = new THREE.Mesh(geo, mat);
-    m.position.copy(vec3OfNode(n));
-    m.userData.nodeId = n.id;
-    state.nodeMeshes.push(m);
-    scene.add(m);
+    if (n.kind === 'gateway') {
+      const geo = new THREE.SphereGeometry(0.12, 14, 14);
+      const mat = new THREE.MeshBasicMaterial({ color: 0xff4763 });
+      const m   = new THREE.Mesh(geo, mat);
+      m.position.copy(vec3OfNode(n));
+      m.userData.nodeId = n.id;
+      m.userData.kind   = 'gateway';
+      state.nodeMeshes.push(m);
+      scene.add(m);
+    } else {
+      sats.push(n);
+    }
+  }
+
+  if (sats.length) {
+    const geo = new THREE.SphereGeometry(0.065, 8, 8);
+    const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    satInstanced = new THREE.InstancedMesh(geo, mat, sats.length);
+    satInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    const baseColor = new THREE.Color(0x8affc1);
+    for (let i = 0; i < sats.length; ++i) {
+      const n = sats[i];
+      _tmpMat.identity();
+      _tmpMat.setPosition(vec3OfNode(n));
+      satInstanced.setMatrixAt(i, _tmpMat);
+      satInstanced.setColorAt(i, baseColor);
+      satInstanceToNodeId.push(n.id);
+      nodeIdToSatInstance[n.id] = i;
+    }
+    satInstanced.instanceMatrix.needsUpdate = true;
+    if (satInstanced.instanceColor) satInstanced.instanceColor.needsUpdate = true;
+    satInstanced.userData.kind = 'satellite';
+    scene.add(satInstanced);
   }
 }
 
-// Recolor all ISL edges based on accumulated link load
-function updateLinkVisuals() {
-  for (const line of state.renderEdges) {
-    const idx  = line.userData.edgeIndex;
-    const load = state.linkLoad.get(idx) || 0;
-    const base = line.userData.baseColor;
-    if (load === 0) {
-      line.material.color.setHex(base);
-      line.material.opacity = 0.35;
-    } else if (load <= 3) {
-      line.material.color.setHex(0x4ad6ff);
-      line.material.opacity = 0.55;
-    } else if (load <= 15) {
-      line.material.color.setHex(0xffb347);
-      line.material.opacity = 0.70;
-    } else {
-      line.material.color.setHex(0xff6a6a);
-      line.material.opacity = 0.85;
-    }
+// ── Heat color map for live edge load (0..1) ─────────────────────────
+function applyHeatRGB(load, baseR, baseG, baseB, out, off) {
+  if (load <= 0.001) {
+    out[off]     = baseR; out[off + 1] = baseG; out[off + 2] = baseB;
+    out[off + 3] = baseR; out[off + 4] = baseG; out[off + 5] = baseB;
+    return;
   }
+  // 0..1 → cyan (low) → amber (mid) → red (high)
+  let r, g, b;
+  if (load < 0.4) {
+    const t = load / 0.4;
+    r = 0.29 + (1.00 - 0.29) * t;
+    g = 0.84 + (0.70 - 0.84) * t;
+    b = 1.00 + (0.28 - 1.00) * t;
+  } else if (load < 0.8) {
+    const t = (load - 0.4) / 0.4;
+    r = 1.00; g = 0.70 - 0.28 * t; b = 0.28 - 0.16 * t;
+  } else {
+    const t = Math.min(1, (load - 0.8) / 0.2);
+    r = 1.00; g = 0.42 - 0.21 * t; b = 0.12;
+  }
+  out[off]     = r; out[off + 1] = g; out[off + 2] = b;
+  out[off + 3] = r; out[off + 4] = g; out[off + 5] = b;
+}
+
+// Update batched edge vertex colors from current load
+function updateLinkVisuals() {
+  if (!edgeBatch || !edgeBatchColors) return;
+  const E = state.edges.length;
+  for (let i = 0; i < E; ++i) {
+    const live = state.edgeLoad ? state.edgeLoad[i] : 0;
+    const cumulative = state.linkLoad.get(i) || 0;
+    const cumNorm = cumulative > 16 ? 1.0 : cumulative / 16;
+    // Combine live (decays) + cumulative (heatmap memory)
+    const load = Math.max(live, cumNorm * 0.6);
+    applyHeatRGB(
+      load,
+      edgeBatchBaseRGB[i * 3 + 0],
+      edgeBatchBaseRGB[i * 3 + 1],
+      edgeBatchBaseRGB[i * 3 + 2],
+      edgeBatchColors, i * 6
+    );
+  }
+  edgeBatch.geometry.attributes.color.needsUpdate = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,10 +724,12 @@ function makeRingMarker(color) {
 function setSource(id) {
   state.source = id; ui.src.value = String(id);
   placeMarker('src', id); refreshPath();
+  showNodeLocation(state.nodes[id], ui.srcLocation);
 }
 function setDest(id) {
   state.dest = id; ui.dst.value = String(id);
   placeMarker('dst', id); refreshPath();
+  showNodeLocation(state.nodes[id], ui.dstLocation);
 }
 
 function placeMarker(role, id) {
@@ -509,14 +746,287 @@ function placeMarker(role, id) {
 
 function locateNode(idx, pullback = 9) {
   if (idx == null || !state.nodes[idx]) return;
-  const target = vec3OfNode(state.nodes[idx]);
-  const radial = target.clone().normalize();
-  const camPos = target.clone().add(radial.multiplyScalar(pullback));
+  const nodePos = vec3OfNode(state.nodes[idx]);
+  const radial  = nodePos.clone().normalize();
+  // Camera flies to a point just outside the node, looking inward toward Earth.
+  // Keep controls.target at the origin so user can still freely orbit Earth.
+  const camPos = nodePos.clone().add(radial.multiplyScalar(pullback));
   state.cameraTween = {
     fromPos: camera.position.clone(), toPos: camPos,
-    fromTarget: controls.target.clone(), toTarget: target.clone(),
+    fromTarget: controls.target.clone(), toTarget: new THREE.Vector3(0, 0, 0),
     elapsed: 0, duration: 1.1,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Background traffic engine — continuous random gateway↔gateway flows
+// ---------------------------------------------------------------------------
+//
+// Each flow has a precomputed Dijkstra route. We advance its hop progress
+// each frame at a fixed visual speed. When it completes a hop we mark the
+// edge as "busy" (live load) and increment the cumulative linkLoad. When
+// the flow reaches its destination we record latency / delivery.
+//
+// The simplified network model:
+//   • each visible flow represents demandMultiplier real packets
+//   • per-edge recent offered bits are tracked with an EMA window
+//   • per-edge ρ = recent_offered_bps / edge_capacity_bps
+//   • access links use a lower gateway capacity than ISL trunks
+//   • queuing delay is estimated per hop via M/D/1 in hopCostsForPath()
+//   • packet loss rises smoothly at high ρ to approximate buffer pressure
+
+// Traffic intensity presets:
+//   rate:   rendered packet flows per second (visible sprites)
+//   demand: multiplier so each rendered packet represents many real packets
+//           (lets us produce visible per-edge ρ without rendering thousands)
+//   cap:    max in-flight rendered flows
+// Tuned so that with 100 Mbps links + Dijkstra routing concentration:
+//   low   ≈ ρ_hot ~0.03   (essentially uncongested)
+//   medium≈ ρ_hot ~0.4-0.5 (mild visible queueing on hot access/trunk links)
+//   high  ≈ ρ_hot ~0.75   (visible queueing + occasional loss)
+//   stress: saturated (clear drops on hot links)
+const TRAFFIC_PRESETS = {
+  low:    { rate:  8,  demand:  400,  cap:  80  },
+  medium: { rate: 35,  demand: 2500,  cap: 220  },
+  high:   { rate: 80,  demand: 1700,  cap: 320  },
+  stress: { rate: 160, demand: 2800,  cap: 500  },
+};
+const TRAFFIC_TAU_S      = 1.5;     // EMA window for offered-load (seconds)
+const TRAFFIC_HOP_VIS_MS = 280;     // visual ms per hop for background flows
+const TRAFFIC_MAX_RENDER = 120;     // cap on visible flow sprites
+const THROUGHPUT_WINDOW_MS = 5000;  // window for goodput calc (5 s)
+const HISTORY_RECENT_FOR_STATS = 200;  // how many recent flows feed the stats
+
+// Probabilistic per-link loss as a function of edge ρ.
+//   ρ < 0.65 : zero
+//   0.65–0.85: linear 0% → 2%
+//   0.85–1.0 : linear 2% → 8%
+function lossProbFromRho(rho) {
+  if (rho < 0.65) return 0;
+  if (rho < 0.85) return 0.02 * (rho - 0.65) / 0.20;
+  return 0.02 + 0.06 * Math.min(1, (rho - 0.85) / 0.15);
+}
+
+function edgeCapacityBps(eIdx, params) {
+  if (eIdx >= 0 && state.edgeIsAccess && state.edgeIsAccess[eIdx]) {
+    return params.gatewayMbps * 1e6;
+  }
+  return params.islMbps * 1e6;
+}
+
+function liveRhoForEdge(eIdx, params) {
+  if (eIdx < 0 || !state.edgeRecentBits || eIdx >= state.edgeRecentBits.length) return 0;
+  return Math.min(0.999, state.edgeRecentBits[eIdx] / TRAFFIC_TAU_S / edgeCapacityBps(eIdx, params));
+}
+
+function addRecentEdgeDemand(eIdx, bits) {
+  if (eIdx >= 0 && state.edgeRecentBits && eIdx < state.edgeRecentBits.length) {
+    state.edgeRecentBits[eIdx] += bits;
+  }
+}
+
+let trafficInstanced = null;        // THREE.InstancedMesh of small dim spheres
+let trafficInstanceCap = 0;
+
+function ensureTrafficInstancedMesh() {
+  if (trafficInstanced) return;
+  const geo = new THREE.SphereGeometry(0.045, 6, 6);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x4ad6ff, transparent: true, opacity: 0.85,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  trafficInstanced = new THREE.InstancedMesh(geo, mat, TRAFFIC_MAX_RENDER);
+  trafficInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  // Hide all initially (zero scale)
+  for (let i = 0; i < TRAFFIC_MAX_RENDER; i++) {
+    _tmpMat.makeScale(0, 0, 0);
+    trafficInstanced.setMatrixAt(i, _tmpMat);
+  }
+  trafficInstanced.instanceMatrix.needsUpdate = true;
+  trafficInstanced.count = TRAFFIC_MAX_RENDER;
+  scene.add(trafficInstanced);
+  trafficInstanceCap = TRAFFIC_MAX_RENDER;
+}
+
+function clearTrafficVisuals() {
+  if (trafficInstanced) {
+    scene.remove(trafficInstanced);
+    trafficInstanced.geometry.dispose();
+    trafficInstanced.material.dispose();
+    trafficInstanced = null;
+  }
+}
+
+function trafficSpawnRate() {
+  const t = state.traffic;
+  if (t.intensity === 'custom') return t.customRate;
+  const p = TRAFFIC_PRESETS[t.intensity];
+  return p ? p.rate : 25;
+}
+
+function trafficDemand() {
+  const t = state.traffic;
+  if (t.intensity === 'custom') return Math.max(50, t.customRate * 25);
+  const p = TRAFFIC_PRESETS[t.intensity];
+  return p ? p.demand : 600;
+}
+
+function pickGateway() {
+  // Find a random gateway. Falls back to any node if none.
+  const gws = [];
+  for (let i = 0; i < state.nodes.length; i++)
+    if (NODE_KIND[i] === 'gateway') gws.push(i);
+  if (gws.length === 0) return Math.floor(Math.random() * state.nodes.length);
+  return gws[Math.floor(Math.random() * gws.length)];
+}
+
+function pickRandomNode() {
+  return Math.floor(Math.random() * state.nodes.length);
+}
+
+function spawnTrafficFlow() {
+  const t = state.traffic;
+  if (t.flows.length >= t.activeCap) return;
+  if (state.nodes.length < 2) return;
+
+  // ~70% gateway↔gateway, ~30% sat↔sat for visual variety + global spread
+  const useSatPair = Math.random() < 0.30;
+  const pickFn = useSatPair ? pickRandomNode : pickGateway;
+
+  let src = pickFn();
+  let dst = pickFn();
+  for (let tries = 0; tries < 10 && dst === src; tries++) dst = pickFn();
+  if (dst === src) return;
+
+  const r = dijkstra(src, dst);
+  if (!r || r.path.length < 2) {
+    t.lostTotal += 1; t.sentTotal += 1;
+    return;
+  }
+  const params = readParams();
+  const costs  = hopCostsForPath(r.path, r.edgeIdxPath, params);
+
+  t.flows.push({
+    id: t.nextFlowId++,
+    path: r.path,
+    edgeIdxPath: r.edgeIdxPath,
+    costs,
+    hopIndex: 0,
+    hopProgress: 0.0,
+    startedAt: performance.now(),
+    delivered: false,
+  });
+  t.sentTotal += 1;
+  t.simSent   += t.demandMultiplier;
+}
+
+function stepTrafficFlows(dtMs) {
+  const t = state.traffic;
+  if (!t.on) return;
+  if (!state.edgeRecentBits || !state.edgeLoad) return;
+  if (!state.nodes.length || !state.edges.length) return;
+
+  // Spawn new flows
+  const rate = trafficSpawnRate();
+  t.spawnAcc += (dtMs / 1000) * rate;
+  while (t.spawnAcc >= 1) { spawnTrafficFlow(); t.spawnAcc -= 1; }
+
+  const params = readParams();
+  const packetBits  = params.packetBytes * 8;
+
+  // ── Sliding-window EMA decay ────────────────────────────────────────
+  // Each edge accumulates "offered bits" — we decay each frame and divide
+  // by τ to get an instantaneous offered-bps. ρ is offered / capacity.
+  // Gateway access links use their own (lower) capacity, making them
+  // visible bottlenecks independent of ISL trunk utilisation.
+  const decay    = Math.exp(-dtMs / 1000 / TRAFFIC_TAU_S);
+  const rb       = state.edgeRecentBits;
+  const E        = rb.length;
+  for (let i = 0; i < E; i++) {
+    rb[i] *= decay;
+    state.edgeLoad[i] = liveRhoForEdge(i, params);
+  }
+
+  // ── Step each flow ──────────────────────────────────────────────────
+  const now       = performance.now();
+  const remaining = [];
+  for (const f of t.flows) {
+    const totalHops = f.path.length - 1;
+    f.hopProgress += dtMs / TRAFFIC_HOP_VIS_MS;
+    let dropped = false;
+
+    while (!f.delivered && !dropped && f.hopProgress >= 1.0) {
+      f.hopProgress -= 1.0;
+      const eIdx = f.edgeIdxPath[f.hopIndex];
+
+      if (eIdx >= 0) {
+        // Add this packet's offered bits (× demand multiplier) to the edge.
+        addRecentEdgeDemand(eIdx, packetBits * t.demandMultiplier);
+        // Cumulative heat-load (for the existing heatmap memory)
+        state.linkLoad.set(eIdx, (state.linkLoad.get(eIdx) || 0) + 1);
+        // Probabilistic loss based on current ρ
+        const liveRho = liveRhoForEdge(eIdx, params);
+        const lossP   = lossProbFromRho(liveRho);
+        if (lossP > 0 && Math.random() < lossP) {
+          t.lostTotal += 1;
+          t.simLost   += t.demandMultiplier;
+          dropped = true;
+          break;
+        }
+      }
+
+      f.hopIndex += 1;
+      if (f.hopIndex >= totalHops) {
+        // Re-cost using current live ρ so the recorded delay reflects congestion
+        const finalCosts = hopCostsForPath(f.path, f.edgeIdxPath, params);
+        t.deliveredTotal  += 1;
+        t.simDelivered    += t.demandMultiplier;
+        t.simBitsDelivered += packetBits * t.demandMultiplier;
+        t.history.push({
+          e2eMs:       finalCosts.totalMs,
+          propMs:      finalCosts.totalPropMs,
+          queueMs:     finalCosts.totalQueueMs,
+          serMs:       finalCosts.totalSerMs,
+          hops:        totalHops,
+          packetBits:  packetBits * t.demandMultiplier,
+          deliveredAt: now,
+        });
+        if (t.history.length > t.historyMax) t.history.shift();
+        f.delivered = true;
+        break;
+      }
+    }
+    if (!f.delivered && !dropped) remaining.push(f);
+  }
+  t.flows = remaining;
+
+  // Render visible packets via instanced sprites
+  ensureTrafficInstancedMesh();
+  const N = Math.min(t.flows.length, TRAFFIC_MAX_RENDER);
+  for (let i = 0; i < N; i++) {
+    const f = t.flows[i];
+    const u = f.path[f.hopIndex], v = f.path[f.hopIndex + 1];
+    const ax = NPX[u], ay = NPY[u], az = NPZ[u];
+    const bx = NPX[v], by = NPY[v], bz = NPZ[v];
+    const tt = f.hopProgress;
+    _tmpMat.makeScale(1, 1, 1);
+    _tmpMat.setPosition(ax + (bx-ax)*tt, ay + (by-ay)*tt, az + (bz-az)*tt);
+    trafficInstanced.setMatrixAt(i, _tmpMat);
+  }
+  for (let i = N; i < TRAFFIC_MAX_RENDER; i++) {
+    _tmpMat.makeScale(0, 0, 0);
+    trafficInstanced.setMatrixAt(i, _tmpMat);
+  }
+  trafficInstanced.instanceMatrix.needsUpdate = true;
+
+  // Refresh edge colors (live congestion)
+  if (t.on) updateLinkVisuals();
+}
+
+function p95(arr) {
+  if (!arr.length) return 0;
+  const s = arr.slice().sort((a, b) => a - b);
+  return s[Math.floor(s.length * 0.95)] || s[s.length - 1];
 }
 
 // ---------------------------------------------------------------------------
@@ -538,14 +1048,17 @@ function buildTrailEdges(path, edgeIdxPath) {
     const b = vec3OfNode(state.nodes[path[i + 1]]);
     const geo = new THREE.BufferGeometry().setFromPoints([a, b]);
     const isSynthetic = edgeIdxPath && edgeIdxPath[i] === -1;
+    // Brighter route highlight so it stands out over background traffic
     const mat = new THREE.LineBasicMaterial({
-      color: isSynthetic ? 0x7744cc : 0x334466,
+      color: isSynthetic ? 0xbb88ff : 0xffd700,
       transparent: true,
-      opacity: isSynthetic ? 0.55 : 0.70,
-      linewidth: 1,
+      opacity: isSynthetic ? 0.85 : 0.85,
+      linewidth: 2,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
     });
     const line = new THREE.Line(geo, mat);
-    line.renderOrder = 1;
+    line.renderOrder = 2;
     line.userData.synthetic = isSynthetic;
     state.trailEdges.push(line);
     scene.add(line);
@@ -569,13 +1082,22 @@ function markHopFailed(i) {
 
 function makePacketGroup(color) {
   const g = new THREE.Group();
-  g.add(new THREE.Mesh(new THREE.SphereGeometry(0.10, 14, 14),
-    new THREE.MeshBasicMaterial({ color })));
-  const glow = new THREE.Mesh(new THREE.SphereGeometry(0.22, 14, 14),
+  // Bright core
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(0.18, 18, 18),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })));
+  // Inner halo
+  const halo1 = new THREE.Mesh(new THREE.SphereGeometry(0.32, 16, 16),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.55,
+      blending: THREE.AdditiveBlending, depthWrite: false }));
+  halo1.userData.isGlow = true;
+  g.add(halo1);
+  // Outer corona
+  const halo2 = new THREE.Mesh(new THREE.SphereGeometry(0.55, 16, 16),
     new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.22,
       blending: THREE.AdditiveBlending, depthWrite: false }));
-  glow.userData.isGlow = true;
-  g.add(glow);
+  halo2.userData.isGlow = true;
+  halo2.userData.coronaScale = 1.0;
+  g.add(halo2);
   g.userData.color = color;
   return g;
 }
@@ -634,6 +1156,8 @@ function dijkstra(src, dst) {
     if (d > dist[u]) continue;
     if (u === dst) break;
     for (const { v, delayMs, edgeIndex } of state.adj[u]) {
+      // Gateways are endpoints only — never relay through one mid-route
+      if (NODE_KIND[v] === 'gateway' && v !== dst) continue;
       const nd = d + delayMs;
       if (nd < dist[v]) { dist[v] = nd; prev[v] = u; prevEdge[v] = edgeIndex; push(nd, v); }
     }
@@ -787,10 +1311,11 @@ function findEdgeIndex(u, v) {
 
 function readParams() {
   return {
-    packetBytes: Math.max(1, Number(ui.packetSize.value)),
-    islMbps:     Math.max(0.001, Number(ui.linkRate.value)),
-    lossProb:    Math.max(0, Math.min(1, Number(ui.lossProb.value))),
-    offeredMbps: Math.max(0, Number(ui.offeredLoad.value) || 0),
+    packetBytes:  Math.max(1, Number(ui.packetSize.value)),
+    islMbps:      Math.max(0.001, Number(ui.linkRate.value)),
+    gatewayMbps:  Math.max(0.001, Number(ui.gatewayRate?.value || 25)),
+    lossProb:     Math.max(0, Math.min(1, Number(ui.lossProb.value))),
+    offeredMbps:  Math.max(0, Number(ui.offeredLoad.value) || 0),
   };
 }
 
@@ -805,22 +1330,22 @@ function md1QueueMs(rho, serMs) {
 function hopCostsForPath(path, edgeIdxPath, params) {
   const rows = [];
   let totMs = 0, totProp = 0, totSer = 0, totQueue = 0;
-  const rateBps    = params.islMbps * 1e6;
   const offeredBps = params.offeredMbps * 1e6;
-  const rho        = Math.min(0.999, offeredBps > 0 ? offeredBps / rateBps : 0);
+  // Live ρ comes from the background-traffic congestion engine when ON
+  const useLive    = state.traffic && state.traffic.on && state.edgeLoad;
+
+  let rhoMax = 0;
 
   for (let i = 0; i < edgeIdxPath.length; ++i) {
     const eIdx = edgeIdxPath[i];
     let distanceKm, propMs, edgeKind;
 
     if (eIdx !== -1 && eIdx < state.edges.length) {
-      // Known ISL/access edge
       const e  = state.edges[eIdx];
       distanceKm = e.distanceKm;
       propMs     = e.delayMs;
       edgeKind   = e.kind;
     } else {
-      // Synthetic BPP link (not a pre-built ISL)
       const ax = NPX[path[i]],   ay = NPY[path[i]],   az = NPZ[path[i]];
       const bx = NPX[path[i+1]], by = NPY[path[i+1]], bz = NPZ[path[i+1]];
       const d  = Math.sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay) + (bz-az)*(bz-az));
@@ -829,8 +1354,23 @@ function hopCostsForPath(path, edgeIdxPath, params) {
       edgeKind   = 'bpp_synthetic';
     }
 
-    const serMs   = (params.packetBytes * 8.0) / rateBps * 1000.0;
-    const queueMs = md1QueueMs(rho, serMs);
+    const syntheticGatewayHop = eIdx === -1 &&
+      (NODE_KIND[path[i]] === 'gateway' || NODE_KIND[path[i + 1]] === 'gateway');
+    const capacityBps = syntheticGatewayHop
+      ? params.gatewayMbps * 1e6
+      : edgeCapacityBps(eIdx, params);
+
+    // Per-hop ρ: combine static slider load with the live congestion of THIS edge.
+    // The static load is interpreted per edge, so gateway links use gateway capacity.
+    const staticRho = Math.min(0.999, offeredBps > 0 ? offeredBps / capacityBps : 0);
+    let edgeRho = staticRho;
+    if (useLive && eIdx !== -1 && eIdx < state.edgeLoad.length) {
+      edgeRho = Math.min(0.999, Math.max(staticRho, state.edgeLoad[eIdx]));
+    }
+    if (edgeRho > rhoMax) rhoMax = edgeRho;
+
+    const serMs   = (params.packetBytes * 8.0) / capacityBps * 1000.0;
+    const queueMs = md1QueueMs(edgeRho, serMs);
     const hopMs   = propMs + serMs + queueMs;
 
     totMs    += hopMs;
@@ -841,13 +1381,13 @@ function hopCostsForPath(path, edgeIdxPath, params) {
     rows.push({
       hop: i + 1,
       u: path[i], v: path[i + 1],
-      edgeKind, distanceKm, propMs, serMs, queueMs, hopMs, rho, eIdx,
+      edgeKind, distanceKm, propMs, serMs, queueMs, hopMs, rho: edgeRho, eIdx,
     });
   }
 
-  const rhoMax = rho;
+  const rho = rhoMax;
   return { rows, totalMs: totMs, totalPropMs: totProp, totalSerMs: totSer,
-           totalQueueMs: totQueue, rho, rhoMax, offeredBps, rateBps };
+           totalQueueMs: totQueue, rho, rhoMax, offeredBps };
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,13 +1689,20 @@ function launchPacket() {
   scene.add(pktGrp);
   state.activePacket = pktGrp;
 
-  // Per-link Bernoulli loss (Dijkstra mode only — BPP uses geometric blocking)
-  const params = readParams();
+  // Per-link loss: combine the static slider and the live ρ-based loss model.
+  // Applied to BOTH Dijkstra and BPP packets when traffic is ON.
+  const params  = readParams();
+  const useLive = state.traffic && state.traffic.on && state.edgeLoad;
   let dropIndex = -1;
-  if (state.routingMode !== 'bpp') {
-    for (let i = 0; i < routePath.length - 1; ++i) {
-      if (Math.random() < params.lossProb) { dropIndex = i; break; }
+  for (let i = 0; i < routePath.length - 1; ++i) {
+    let p = params.lossProb;
+    if (useLive) {
+      const eIdx = routeEdgeIdx[i];
+      if (eIdx >= 0 && eIdx < state.edgeLoad.length) {
+        p = Math.max(p, lossProbFromRho(state.edgeLoad[eIdx]));
+      }
     }
+    if (p > 0 && Math.random() < p) { dropIndex = i; break; }
   }
 
   activePacketAnim = {
@@ -1184,24 +1731,44 @@ function launchBurst(n) {
   const params = readParams();
   const costs  = hopCostsForPath(r.path, r.edgeIdxPath, params);
   const hops   = r.path.length - 1;
+  const packetBits = params.packetBytes * 8;
 
+  const useLive = state.traffic && state.traffic.on && state.edgeLoad;
   for (let k = 0; k < n; ++k) {
     let drop = -1;
-    for (let i = 0; i < hops; ++i)
-      if (Math.random() < params.lossProb) { drop = i; break; }
+    for (let i = 0; i < hops; ++i) {
+      let p = params.lossProb;
+      if (useLive) {
+        const eIdx = r.edgeIdxPath[i];
+        if (eIdx >= 0 && eIdx < state.edgeLoad.length) {
+          p = Math.max(p, lossProbFromRho(state.edgeLoad[eIdx]));
+        }
+      }
+      if (p > 0 && Math.random() < p) { drop = i; break; }
+    }
     const delivered = drop === -1;
     state.packetsSent    += 1;
     state.dijkstraSent   += 1;
     if (delivered) {
       state.packetsDelivered   += 1;
       state.dijkstraDelivered  += 1;
-      state.totalLatencyMs     += costs.totalMs;
+      state.totalLatencyMs        += costs.totalMs;
+      state.dijkstraTotalMs       += costs.totalMs;
+      state.dijkstraTotalPropMs   += costs.totalPropMs;
+      state.dijkstraTotalQueueMs  += costs.totalQueueMs;
+      state.dijkstraTotalHops     += hops;
       // Track link load
       for (const eIdx of r.edgeIdxPath) {
-        if (eIdx >= 0) state.linkLoad.set(eIdx, (state.linkLoad.get(eIdx) || 0) + 1);
+        if (eIdx >= 0) {
+          state.linkLoad.set(eIdx, (state.linkLoad.get(eIdx) || 0) + 1);
+          addRecentEdgeDemand(eIdx, packetBits);
+        }
       }
     } else {
       state.packetsLost += 1;
+      for (let i = 0; i <= drop && i < r.edgeIdxPath.length; i++) {
+        addRecentEdgeDemand(r.edgeIdxPath[i], packetBits);
+      }
     }
     // Flash hop edges
     for (let i = 0; i < hops; ++i) {
@@ -1251,9 +1818,20 @@ function stepActivePacket(dtMs) {
     updateLinkVisuals();
 
     state.packetsDelivered += 1;
-    if (p.meta.mode === 'bpp') state.bppDelivered   += 1;
-    else                       state.dijkstraDelivered += 1;
-    state.totalLatencyMs += p.totalMs;
+    if (p.meta.mode === 'bpp') {
+      state.bppDelivered       += 1;
+      state.bppTotalMs         += p.costs.totalMs;
+      state.bppTotalPropMs     += p.costs.totalPropMs;
+      state.bppTotalQueueMs    += p.costs.totalQueueMs;
+      state.bppTotalHops       += totalHops;
+    } else {
+      state.dijkstraDelivered     += 1;
+      state.dijkstraTotalMs       += p.costs.totalMs;
+      state.dijkstraTotalPropMs   += p.costs.totalPropMs;
+      state.dijkstraTotalQueueMs  += p.costs.totalQueueMs;
+      state.dijkstraTotalHops     += totalHops;
+    }
+    state.totalLatencyMs += p.costs.totalMs;
     activePacketAnim = null;
     updateAggregate();
     setTimeout(() => clearActivePacket(), 700);
@@ -1293,8 +1871,12 @@ function stepActivePacket(dtMs) {
   if (p.hopProgress >= 1.0) {
     p.hopProgress = 0.0;
     const done = p.hopIndex;
+    const eIdx = p.edgeIdxPath[done];
+    if (eIdx >= 0) {
+      addRecentEdgeDemand(eIdx, readParams().packetBytes * 8);
+    }
 
-    // Bernoulli loss (Dijkstra only)
+    // Bernoulli loss from the static slider and live rho-based congestion.
     if (p.dropIndex !== -1 && done >= p.dropIndex) {
       markHopFailed(done);
       setPacketColor(state.activePacket, 0xff3333);
@@ -1447,26 +2029,148 @@ function showCompareResults(d, b) {
 // Session stats panel
 // ---------------------------------------------------------------------------
 
+// Live traffic dashboard — refreshed at ~5Hz from animate()
+function updateLiveDashboard() {
+  if (!ui.liveTraffic) return;
+  const t = state.traffic;
+  if (!t.on && t.sentTotal === 0) {
+    ui.liveTraffic.innerHTML = `<div class="muted" style="font-size:10px">
+      Background traffic OFF — toggle ON above to start continuous flows.
+    </div>`;
+    return;
+  }
+
+  // Use simulation-amplified counts (each rendered packet represents N real packets)
+  const simSent = t.simSent, simDel = t.simDelivered, simLost = t.simLost;
+  const lossRate = simSent ? (simLost / simSent * 100) : 0;
+
+  // Sliding-window stats from recent delivered-flow history
+  const hist = t.history;
+  const N    = Math.min(hist.length, HISTORY_RECENT_FOR_STATS);
+  const recent = N > 0 ? hist.slice(hist.length - N) : [];
+
+  let mean = 0, meanProp = 0, meanQueue = 0, meanSer = 0, jitter = 0, p95v = 0;
+  if (recent.length > 0) {
+    let sE = 0, sP = 0, sQ = 0, sSer = 0;
+    for (const r of recent) {
+      sE += r.e2eMs; sP += r.propMs; sQ += r.queueMs; sSer += r.serMs;
+    }
+    mean      = sE   / recent.length;
+    meanProp  = sP   / recent.length;
+    meanQueue = sQ   / recent.length;
+    meanSer   = sSer / recent.length;
+
+    // Jitter — mean absolute successive E2E difference (RTP-style)
+    if (recent.length > 1) {
+      let s = 0;
+      for (let i = 1; i < recent.length; i++) {
+        s += Math.abs(recent[i].e2eMs - recent[i - 1].e2eMs);
+      }
+      jitter = s / (recent.length - 1);
+    }
+    // p95
+    const sorted = recent.map(r => r.e2eMs).sort((a, b) => a - b);
+    p95v = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+  }
+
+  // Goodput — recent delivered bits over the throughput window
+  const now = performance.now();
+  let bitsRecent = 0;
+  for (let i = hist.length - 1; i >= 0; i--) {
+    if (now - hist[i].deliveredAt > THROUGHPUT_WINDOW_MS) break;
+    bitsRecent += hist[i].packetBits;
+  }
+  const goodputMbps = bitsRecent / (THROUGHPUT_WINDOW_MS / 1000) / 1e6;
+
+  // Busiest edge ρ
+  let maxLoad = 0;
+  if (state.edgeLoad) {
+    for (let i = 0; i < state.edgeLoad.length; i++) {
+      if (state.edgeLoad[i] > maxLoad) maxLoad = state.edgeLoad[i];
+    }
+  }
+  const congestionLabel = maxLoad < 0.30 ? 'low' :
+                          maxLoad < 0.60 ? 'moderate' :
+                          maxLoad < 0.85 ? 'high' : 'saturated';
+  const congestionClass = maxLoad < 0.30 ? 'ok-row' :
+                          maxLoad < 0.60 ? '' :
+                          maxLoad < 0.85 ? 'warn-row' : 'err-row';
+
+  const fmt = (v, d=1, unit='ms') => v > 0 ? v.toFixed(d) + ' ' + unit : '—';
+
+  ui.liveTraffic.innerHTML = `
+    <div style="font-size:10px;font-weight:700;color:var(--accent-2);margin-bottom:4px">
+      Background traffic ${t.on ? '<span style="color:var(--accent-2)">● LIVE</span>' : '<span style="color:var(--ink-dim)">paused</span>'}
+    </div>
+    ${kv('Active flows', t.flows.length + ' / ' + t.activeCap)}
+    ${kv('Packets sent (sim)',      simSent.toLocaleString())}
+    ${kv('Delivered',               simDel.toLocaleString())}
+    ${kv('Lost',                    simLost.toLocaleString())}
+    ${kv('Packet loss',             simSent ? lossRate.toFixed(2) + ' %' : '—',
+         lossRate > 4 ? 'err-row' : lossRate > 1 ? 'warn-row' : simSent ? 'ok-row' : '')}
+    ${kv('Mean E2E delay',          mean > 0 ? '<b>' + mean.toFixed(1) + ' ms</b>' : '—')}
+    ${kv('  Propagation',           fmt(meanProp))}
+    ${kv('  Queuing',               fmt(meanQueue, 2))}
+    ${kv('  Serialization',         fmt(meanSer, 2))}
+    ${kv('p95 delay',               fmt(p95v))}
+    ${kv('Jitter',                  fmt(jitter, 2))}
+    ${kv('Goodput',                 goodputMbps > 0 ? goodputMbps.toFixed(1) + ' Mbps' : '—')}
+    ${kv('Busiest link ρ',          maxLoad.toFixed(2) + ' (' + congestionLabel + ')', congestionClass)}
+  `;
+}
+
 function updateAggregate() {
-  const sent      = state.packetsSent;
-  const delivered = state.packetsDelivered;
-  const lost      = state.packetsLost;
-  const pdr       = sent ? (delivered / sent * 100) : 0;
-  const meanMs    = delivered ? (state.totalLatencyMs / delivered) : 0;
-  const bppIR     = state.bppSent ? ((state.bppSent - state.bppDelivered) / state.bppSent * 100) : 0;
+  const sent = state.packetsSent;
+  const lost = state.packetsLost;
+  const lossRate = sent ? (lost / sent * 100) : 0;
+
+  // Dijkstra metrics
+  const dSent = state.dijkstraSent;
+  const dDel  = state.dijkstraDelivered;
+  const dLoss = dSent - dDel;
+  const dLossPct  = dSent ? (dLoss / dSent * 100) : 0;
+  const dMeanHops = dDel  ? (state.dijkstraTotalHops / dDel) : 0;
+  const dMeanE2E  = dDel  ? (state.dijkstraTotalMs   / dDel) : 0;
+  const dMeanProp = dDel  ? (state.dijkstraTotalPropMs / dDel) : 0;
+  const dMeanQ    = dDel  ? (state.dijkstraTotalQueueMs / dDel) : 0;
+
+  // BPP metrics
+  const bSent = state.bppSent;
+  const bDel  = state.bppDelivered;
+  const bIR   = bSent ? ((bSent - bDel) / bSent * 100) : 0;
+  const bMeanHops = bDel ? (state.bppTotalHops / bDel) : 0;
+  const bMeanE2E  = bDel ? (state.bppTotalMs   / bDel) : 0;
+  const bMeanProp = bDel ? (state.bppTotalPropMs  / bDel) : 0;
+  const bMeanQ    = bDel ? (state.bppTotalQueueMs / bDel) : 0;
+
+  const na = '—';
+  const ms = (v, d=1) => v > 0 ? v.toFixed(d) + ' ms' : na;
+
+  const dSerEst = (dMeanE2E > 0 && dMeanProp > 0) ? dMeanE2E - dMeanProp - dMeanQ : 0;
+  const bSerEst = (bMeanE2E > 0 && bMeanProp > 0) ? bMeanE2E - bMeanProp - bMeanQ : 0;
 
   ui.metrics.innerHTML = `
-    ${kv('Packets sent', sent)}
-    ${kv('Delivered', delivered)}
-    ${kv('Lost / interrupted', lost)}
-    ${kv('Delivery ratio', pdr.toFixed(1) + ' %')}
-    ${kv('Mean E2E (delivered)', meanMs.toFixed(1) + ' ms')}
-    <div style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px">
-    ${kv('Dijkstra sent', state.dijkstraSent)}
-    ${kv('Dijkstra delivered', state.dijkstraDelivered)}
-    ${kv('BPP sent', state.bppSent)}
-    ${kv('BPP interruption rate', bppIR.toFixed(1) + ' %')}
+    <div style="margin-top:8px;margin-bottom:4px;font-size:10px;font-weight:700;color:var(--accent)">
+      Manual · Dijkstra — ${dSent} packets
     </div>
+    ${kv('Packet loss', dSent ? dLossPct.toFixed(1) + ' %' : na,
+         dLossPct > 20 ? 'err-row' : dLossPct > 5 ? 'warn-row' : dSent ? 'ok-row' : '')}
+    ${kv('Mean hops', dMeanHops > 0 ? dMeanHops.toFixed(1) : na)}
+    ${kv('Total delay (mean)', dMeanE2E > 0 ? '<b>' + dMeanE2E.toFixed(1) + ' ms</b>' : na)}
+    ${kv('  Propagation', ms(dMeanProp))}
+    ${kv('  Queuing', ms(dMeanQ, 2))}
+    ${kv('  Serialization', dSerEst > 0 ? dSerEst.toFixed(2) + ' ms' : na)}
+
+    <div style="margin-top:8px;margin-bottom:4px;font-size:10px;font-weight:700;color:#ff77dd">
+      Manual · BPP Paper — ${bSent} packets
+    </div>
+    ${kv('Interruption rate', bSent ? bIR.toFixed(1) + ' %' : na,
+         bIR > 50 ? 'err-row' : bIR > 20 ? 'warn-row' : bSent ? 'ok-row' : '')}
+    ${kv('Mean hops', bMeanHops > 0 ? bMeanHops.toFixed(1) : na)}
+    ${kv('Total delay (mean)', bMeanE2E > 0 ? '<b>' + bMeanE2E.toFixed(1) + ' ms</b>' : na)}
+    ${kv('  Propagation', ms(bMeanProp))}
+    ${kv('  Queuing', ms(bMeanQ, 2))}
+    ${kv('  Serialization', bSerEst > 0 ? bSerEst.toFixed(2) + ' ms' : na)}
   `;
 }
 
@@ -1474,15 +2178,28 @@ function updateAggregate() {
 // Hover tooltip + click picking
 // ---------------------------------------------------------------------------
 
-function onPointerMove(ev) {
+function _pickNodeAt(ev) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x =  ((ev.clientX - rect.left) / rect.width)  * 2 - 1;
   pointer.y = -((ev.clientY - rect.top)  / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects(state.nodeMeshes, false);
-  if (hits.length) {
-    const nid = hits[0].object.userData.nodeId;
-    const n   = state.nodes[nid];
+  // Gateways (individual meshes) take priority since they're larger
+  const targets = [...state.nodeMeshes];
+  if (satInstanced) targets.push(satInstanced);
+  const hits = raycaster.intersectObjects(targets, false);
+  if (!hits.length) return { nid: null, rect };
+  const h = hits[0];
+  if (h.object === satInstanced) {
+    const nid = satInstanceToNodeId[h.instanceId];
+    return { nid, rect };
+  }
+  return { nid: h.object.userData.nodeId, rect };
+}
+
+function onPointerMove(ev) {
+  const { nid, rect } = _pickNodeAt(ev);
+  if (nid != null && state.nodes[nid]) {
+    const n = state.nodes[nid];
     const load = [...state.linkLoad.entries()]
       .filter(([ei]) => state.edges[ei] && (state.edges[ei].u === nid || state.edges[ei].v === nid))
       .reduce((s, [, c]) => s + c, 0);
@@ -1502,13 +2219,8 @@ function onPointerMove(ev) {
 
 function onClick(ev) {
   if (!state.pickMode) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x =  ((ev.clientX - rect.left) / rect.width)  * 2 - 1;
-  pointer.y = -((ev.clientY - rect.top)  / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects(state.nodeMeshes, false);
-  if (!hits.length) return;
-  const nid = hits[0].object.userData.nodeId;
+  const { nid } = _pickNodeAt(ev);
+  if (nid == null) return;
   if (state.pickMode === 'src') { setSource(nid); ui.pickSrc.classList.remove('active'); }
   else                          { setDest(nid);   ui.pickDst.classList.remove('active'); }
   state.pickMode = null; ui.status.textContent = 'ready';
@@ -1583,14 +2295,34 @@ function parseEdges(rows) {
 // ---------------------------------------------------------------------------
 
 function clearSceneData() {
+  // Legacy per-edge lines (in case any leftover)
   for (const l of state.renderEdges) { scene.remove(l); l.geometry.dispose(); l.material.dispose(); }
   state.renderEdges = [];
+  // Batched edges
+  if (edgeBatch) {
+    scene.remove(edgeBatch); edgeBatch.geometry.dispose(); edgeBatch.material.dispose();
+    edgeBatch = null; edgeBatchColors = null; edgeBatchBaseRGB = null;
+  }
+  // Gateway meshes
   for (const m of state.nodeMeshes)  { scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
   state.nodeMeshes = [];
+  // Instanced satellites
+  if (satInstanced) {
+    scene.remove(satInstanced); satInstanced.geometry.dispose(); satInstanced.material.dispose();
+    satInstanced = null; satInstanceToNodeId = []; nodeIdToSatInstance = [];
+  }
+  // Background traffic visuals
+  clearTrafficVisuals();
+  // Manual route trail
   clearTrailEdges();
   if (srcMarker) { scene.remove(srcMarker); srcMarker = null; }
   if (dstMarker) { scene.remove(dstMarker); dstMarker = null; }
   clearActivePacket();
+  // Reset live engine state
+  if (state.traffic) {
+    state.traffic.flows = [];
+    state.traffic.spawnAcc = 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,7 +2361,13 @@ function loadData(nodesRows, edgesRows, meta, keepSelection = false) {
 
   const sub = subsampleRows(nodesRows, edgesRows);
   nodesRows = sub.nodesRows;
-  edgesRows = sub.edgesRows;
+  // Cap each gateway to its closest satellite access links. Cap scales
+  // with satellite density so subsampling doesn't disconnect the graph.
+  const satCount = sub.nodesRows.filter(r => r.kind !== 'gateway').length;
+  const gwCap = satCount >= 3000 ? 12 :
+                satCount >= 1500 ? 18 :
+                satCount >= 800  ? 28 : 50;
+  edgesRows = capGatewayLinks(sub.edgesRows, sub.nodesRows, gwCap);
 
   state.nodes = parseNodes(nodesRows);
   state.edges = parseEdges(edgesRows);
@@ -1650,10 +2388,14 @@ function loadData(nodesRows, edgesRows, meta, keepSelection = false) {
 
   const sats = state.nodes.filter(n => n.kind !== 'gateway').length;
   const gws  = state.nodes.filter(n => n.kind === 'gateway').length;
+  const snapTime = meta ? formatSnapshotTime(meta.base_epoch_utc) : formatSnapshotTime(state.epoch);
   ui.metaInfo.innerHTML = meta
     ? `<div>
          <span class="pill">schema ${meta.schema_version || '?'}</span>
-         <span class="pill">${meta.base_epoch_utc || ''}</span>
+         <span class="pill">fixed epoch</span>
+       </div>
+       <div style="margin-top:5px;color:var(--accent-2)">
+         ${snapTime}
        </div>
        <div style="margin-top:5px">
          ${sats} satellites &middot; ${gws} gateways &middot; ${state.edges.length} links
@@ -1665,52 +2407,14 @@ function loadData(nodesRows, edgesRows, meta, keepSelection = false) {
 }
 
 // ---------------------------------------------------------------------------
-// Epoch management
-// ---------------------------------------------------------------------------
-
-function populateEpochSelect() {
-  ui.epochSelect.innerHTML = '';
-  for (let i = 0; i < EPOCH_LABELS.length; i++) {
-    const opt = document.createElement('option');
-    opt.value = String(i);
-    opt.textContent = EPOCH_LABELS[i];
-    ui.epochSelect.appendChild(opt);
-  }
-  ui.epochSelect.value = '0';
-}
-
-async function switchEpoch(idx) {
-  ui.status.textContent = `loading epoch ${idx}…`;
-  try {
-    const [nodesRows, edgesRows] = await Promise.all([
-      fetchCsv(EPOCH_NODES_URLS[idx]),
-      fetchCsv(EPOCH_EDGES_URLS[idx]),
-    ]);
-    state.epochIdx = idx;
-    // Cache raw rows so satellite-count changes can reuse them without re-fetching
-    state.rawNodesRows = nodesRows;
-    state.rawEdgesRows = edgesRows;
-    // Reload meta only for epoch 0
-    let meta = null;
-    if (idx === 0) meta = await fetchJson(META_URL);
-    state.rawMeta = meta || state.rawMeta;
-    loadData(nodesRows, edgesRows, meta, true);
-    ui.status.textContent = `epoch ${idx} loaded — ${EPOCH_LABELS[idx].split('—')[1].trim()}`;
-  } catch (err) {
-    ui.status.textContent = `epoch ${idx} load failed: ${err.message}`;
-    console.warn('Epoch switch failed:', err);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Status overlay
 // ---------------------------------------------------------------------------
 
 function updateStatusOverlay() {
   const mode  = state.routingMode === 'bpp' ? 'BPP paper routing' : 'Dijkstra';
-  const epoch = `epoch ${state.epochIdx}`;
+  const snapshotTime = state.epoch ? formatSnapshotTime(state.epoch) : `epoch ${state.epochIdx}`;
   ui.status.innerHTML =
-    `${state.nodes.length} nodes &middot; ${state.edges.length} links &middot; ${mode} &middot; ${epoch}`;
+    `${state.nodes.length} nodes &middot; ${state.edges.length} links &middot; ${mode} &middot; ${snapshotTime}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,8 +2436,21 @@ function wireUi() {
 
   ui.randomPair.addEventListener('click', () => {
     const n = state.nodes.length; if (n < 2) return;
-    let a = Math.floor(Math.random() * n);
-    let b = Math.floor(Math.random() * (n - 1)); if (b >= a) b += 1;
+    // Prefer gateway-to-gateway pairs (more realistic flows). Retry until
+    // we find a pair Dijkstra can actually route — avoids "No ISL connectivity"
+    // errors when the graph is partially disconnected.
+    const gws = [];
+    for (let i = 0; i < n; i++) if (NODE_KIND[i] === 'gateway') gws.push(i);
+    const pool = gws.length >= 2 ? gws : Array.from({length: n}, (_, i) => i);
+
+    let a = -1, b = -1;
+    for (let tries = 0; tries < 30; tries++) {
+      a = pool[Math.floor(Math.random() * pool.length)];
+      b = pool[Math.floor(Math.random() * pool.length)];
+      if (a === b) continue;
+      if (dijkstra(a, b)) { setSource(a); setDest(b); return; }
+    }
+    // Last resort — just use any pair, even if no path
     setSource(a); setDest(b);
   });
 
@@ -1783,7 +2500,7 @@ function wireUi() {
     ui.timeScaleLabel.textContent = state.timeScale.toFixed(1) + '×';
   });
 
-  for (const el of [ui.packetSize, ui.linkRate, ui.offeredLoad, ui.lossProb]) {
+  for (const el of [ui.packetSize, ui.linkRate, ui.gatewayRate, ui.offeredLoad, ui.lossProb]) {
     if (!el) continue;
     el.addEventListener('change', refreshPath);
     el.addEventListener('input',  refreshPath);
@@ -1794,15 +2511,9 @@ function wireUi() {
   ui.stop.addEventListener('click', stopAll);
   if (ui.compare) ui.compare.addEventListener('click', runComparison);
 
-  ui.fileInput.addEventListener('change', ev => {
-    handleFileInput(ev.target.files); ev.target.value = '';
-  });
-
-  // Epoch selector
-  if (ui.epochSelect) {
-    ui.epochSelect.addEventListener('change', () => {
-      const idx = Number(ui.epochSelect.value);
-      if (idx !== state.epochIdx) switchEpoch(idx);
+  if (ui.fileInput) {
+    ui.fileInput.addEventListener('change', ev => {
+      handleFileInput(ev.target.files); ev.target.value = '';
     });
   }
 
@@ -1815,10 +2526,59 @@ function wireUi() {
         loadData(state.rawNodesRows, state.rawEdgesRows, state.rawMeta || null, false);
         ui.status.textContent = `loaded — ${label}`;
       } else {
-        switchEpoch(state.epochIdx ?? 0);
+        ui.status.textContent = 'snapshot data not loaded yet';
       }
     });
   }
+
+  // Background traffic
+  if (ui.trafficOn) {
+    ui.trafficOn.addEventListener('change', () => {
+      state.traffic.on = !!ui.trafficOn.checked;
+      if (!state.traffic.on) {
+        // Pause: hide flows but keep stats
+        state.traffic.flows = [];
+        if (state.edgeRecentBits) state.edgeRecentBits.fill(0);
+        if (state.edgeLoad) state.edgeLoad.fill(0);
+        if (trafficInstanced) {
+          for (let i = 0; i < TRAFFIC_MAX_RENDER; i++) {
+            _tmpMat.makeScale(0, 0, 0);
+            trafficInstanced.setMatrixAt(i, _tmpMat);
+          }
+          trafficInstanced.instanceMatrix.needsUpdate = true;
+        }
+      }
+      updateAggregate();
+    });
+  }
+  function applyTrafficPreset() {
+    const t = state.traffic;
+    const preset = TRAFFIC_PRESETS[t.intensity];
+    if (preset) {
+      t.demandMultiplier = preset.demand;
+      t.activeCap        = preset.cap;
+    } else {
+      t.demandMultiplier = trafficDemand();
+      t.activeCap        = Math.min(600, Math.max(80, Math.round(t.customRate * 6)));
+    }
+  }
+  if (ui.trafficIntensity) {
+    ui.trafficIntensity.addEventListener('change', () => {
+      state.traffic.intensity = ui.trafficIntensity.value;
+      ui.trafficCustomRow.style.display =
+        state.traffic.intensity === 'custom' ? 'block' : 'none';
+      applyTrafficPreset();
+    });
+  }
+  if (ui.trafficRate) {
+    ui.trafficRate.addEventListener('input', () => {
+      state.traffic.customRate = Number(ui.trafficRate.value);
+      ui.trafficRateVal.textContent = state.traffic.customRate + '/s';
+      if (state.traffic.intensity === 'custom') applyTrafficPreset();
+    });
+  }
+  // Initial preset application
+  applyTrafficPreset();
 
   // Reset heatmap
   if (ui.resetHeatmap) {
@@ -1827,6 +2587,20 @@ function wireUi() {
       state.packetsSent = 0; state.packetsDelivered = 0; state.packetsLost = 0;
       state.totalLatencyMs = 0; state.bppSent = 0; state.bppDelivered = 0;
       state.dijkstraSent = 0; state.dijkstraDelivered = 0;
+      state.dijkstraTotalMs = 0; state.dijkstraTotalPropMs = 0;
+      state.dijkstraTotalQueueMs = 0; state.dijkstraTotalHops = 0;
+      state.bppTotalMs = 0; state.bppTotalPropMs = 0;
+      state.bppTotalQueueMs = 0; state.bppTotalHops = 0;
+      state.traffic.sentTotal = 0;
+      state.traffic.deliveredTotal = 0;
+      state.traffic.lostTotal = 0;
+      state.traffic.history = [];
+      state.traffic.simSent = 0;
+      state.traffic.simDelivered = 0;
+      state.traffic.simLost = 0;
+      state.traffic.simBitsDelivered = 0;
+      if (state.edgeLoad) state.edgeLoad.fill(0);
+      if (state.edgeRecentBits) state.edgeRecentBits.fill(0);
       updateLinkVisuals(); updateAggregate();
       ui.pathInfo.innerHTML = '<span class="muted">stats reset</span>';
       ui.compareSection.style.display = 'none';
@@ -1840,12 +2614,22 @@ function wireUi() {
 
 let lastTs = performance.now();
 
+let liveDashAcc = 0;
+
 function animate() {
   const now = performance.now();
   const dt  = Math.min(now - lastTs, 100);
   lastTs = now;
 
   stepActivePacket(dt);
+  stepTrafficFlows(dt);
+
+  // Throttle live dashboard updates to ~5 Hz
+  liveDashAcc += dt;
+  if (liveDashAcc > 200) {
+    liveDashAcc = 0;
+    updateLiveDashboard();
+  }
 
   // Camera fly-to tween
   if (state.cameraTween) {
@@ -1872,9 +2656,9 @@ function animate() {
 
 async function main() {
   initScene();
-  populateEpochSelect();
   wireUi();
   updateAggregate();
+  updateLiveDashboard();
   ui.status.textContent = 'loading snapshot…';
 
   try {
@@ -1896,7 +2680,7 @@ async function main() {
       Then open: <code>http://localhost:8080/tools/visualizer/</code><br/>
       Error: ${err.message}
     </div>`;
-    ui.status.textContent = 'no snapshot — use "Load local CSVs"';
+    ui.status.textContent = 'snapshot unavailable';
   }
 
   animate();
