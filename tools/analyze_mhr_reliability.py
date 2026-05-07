@@ -53,6 +53,9 @@ import sys
 from itertools import permutations
 from typing import Dict, List, Optional, Tuple
 
+import heapq
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 
@@ -77,6 +80,12 @@ DEFAULT_THETA_R = math.pi / 6.0      # max direction angle  (Wang p.16)
 DEFAULT_THETA_S = math.pi / 10.0     # min dome angle       (Wang p.16)
 DEFAULT_D_TH_KM = 4000.0             # max comm. distance   (Wang p.16)
 DEFAULT_THETA_M = math.pi            # transmitter/receiver dome angle
+
+# Speed of light in vacuum for propagation delay computation.
+C_KM_PER_S = 299_792.458
+
+# Percentiles reported for hop count and latency distributions.
+PERCENTILES = [50, 90, 95, 99]
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +347,19 @@ def build_T1(s: List[int], P_I: np.ndarray) -> np.ndarray:
             for k in _priority_iter_higher_than(s, j):
                 v *= P_I[i, k]
             T[i, j] = v
-        # Row-normalise to be safe against numerical drift.
+        # Row-normalise to absorb floating-point drift. In exact arithmetic
+        # the row already sums to 1 because the denominator (1 - P^S_i)
+        # is the correct normaliser. A large deviation here signals a bug
+        # in the priority formula or the P_I values.
         rs = T[i, :].sum()
-        if rs > 0.0:
+        if rs > 1e-12:
+            if abs(rs - 1.0) > 1e-4:
+                import sys
+                print(
+                    f"WARNING: T1 row {i} sums to {rs:.6g} before normalisation "
+                    f"(expected ~1.0). Check priority vector and P_I values.",
+                    file=sys.stderr,
+                )
             T[i, :] /= rs
     return T
 
@@ -447,7 +466,12 @@ def average_dome_per_step(tiers: List[Dict], T1: np.ndarray, v: np.ndarray,
 
 
 def estimate_N_h(theta_m: float, theta_o: float) -> int:
-    """Equation (5): N_h = round(theta_m / theta_o)."""
+    """Equation (5): N_h = round(theta_m / theta_o).
+
+    Eq. (7) requires N_h >= 2 (T2^(N_h-2) is undefined for N_h < 2).
+    When N_h resolves to 1, multi_hop_interruption uses T3 alone as a
+    single-hop approximation, which is reasonable but not exact.
+    """
     if theta_o <= 0:
         return 1
     return max(1, int(round(theta_m / theta_o)))
@@ -694,10 +718,49 @@ def simulate_route(node_arr: Dict,
                 best_per_tier[tier_idx] = (dome_to_rx, cand_idx)
 
         if not best_per_tier:
+            # Count which constraint was the bottleneck (satellite-to-satellite
+            # hops only — gateway hops relax c1/c2 so are excluded from the tally).
+            n_sat_in_range = 0
+            n_fail_los     = 0
+            n_fail_c1      = 0
+            n_fail_c2      = 0
+            for ci in candidate_idxs:
+                if ci == current_idx or ci == dst_idx or ci in visited:
+                    continue
+                if kinds[ci] == "gateway" or kinds[current_idx] == "gateway":
+                    continue
+                n_sat_in_range += 1
+                cp = pos[ci]
+                if not has_line_of_sight(cur_pos, cp):
+                    n_fail_los += 1
+                    continue
+                da = direction_angle(cur_pos, cp, receiver_pos)
+                if da > theta_r:
+                    n_fail_c1 += 1
+                    continue
+                cn = norms[ci]
+                if cn > 0 and cur_norm > 0:
+                    cd = float(np.dot(cur_pos, cp)) / (cur_norm * cn)
+                    cd = max(-1.0, min(1.0, cd))
+                    if math.acos(cd) < theta_s:
+                        n_fail_c2 += 1
+            binding = (
+                "c1_direction" if n_fail_c1 > 0 and (n_sat_in_range - n_fail_los - n_fail_c1) == 0
+                else "c2_dome" if n_fail_c2 > 0
+                else "c3_los" if n_fail_los > 0
+                else "none_in_range"
+            )
             return {
                 "success": False, "interrupt": True, "hops": hop,
                 "interrupted_hop": hop, "reason": "no_candidates",
                 "path": path,
+                "failure_breakdown": {
+                    "sat_candidates_in_range": n_sat_in_range,
+                    "failed_los":        n_fail_los,
+                    "failed_c1_direction": n_fail_c1,
+                    "failed_c2_dome":    n_fail_c2,
+                    "binding_constraint": binding,
+                },
             }
 
         # Pick the tier with the highest priority (smallest priority value).
@@ -712,6 +775,135 @@ def simulate_route(node_arr: Dict,
         "interrupted_hop": max_hops, "reason": "max_hops_exceeded",
         "path": path,
     }
+
+
+# ---------------------------------------------------------------------------
+# Dijkstra baseline (shortest-propagation-delay routing on the ISL graph)
+# ---------------------------------------------------------------------------
+
+def build_isl_graph(edges_df: pd.DataFrame,
+                    node_arr: Dict) -> Dict[int, List[Tuple[int, float, float]]]:
+    """Build adjacency dict {u_idx: [(v_idx, distance_km, prop_delay_ms), ...]}.
+
+    Uses snapshot integer ids (the `id` column of the nodes CSV, also used
+    as `u`/`v` in the edges CSV). Edges are undirected: both directions
+    are stored.
+    """
+    g: Dict[int, List[Tuple[int, float, float]]] = defaultdict(list)
+    if edges_df is None or edges_df.empty:
+        return g
+    id_to_idx = node_arr["id_to_idx"]
+    # Vectorise the column accesses for speed.
+    u_col = edges_df["u"].tolist()
+    v_col = edges_df["v"].tolist()
+    d_col = edges_df["distance_km"].tolist()
+    has_prop = "prop_delay_ms" in edges_df.columns
+    p_col = edges_df["prop_delay_ms"].tolist() if has_prop else None
+    for k in range(len(u_col)):
+        u = id_to_idx.get(u_col[k])
+        v = id_to_idx.get(v_col[k])
+        if u is None or v is None:
+            continue
+        d_km = float(d_col[k])
+        prop_ms = float(p_col[k]) if has_prop else (d_km / C_KM_PER_S * 1000.0)
+        g[u].append((v, d_km, prop_ms))
+        g[v].append((u, d_km, prop_ms))
+    return g
+
+
+def dijkstra_route(graph: Dict[int, List[Tuple[int, float, float]]],
+                   src_idx: int, dst_idx: int) -> Dict:
+    """Shortest-propagation-delay path on the pre-built ISL graph.
+
+    Returns dict with: success, hops, total_distance_km, total_prop_ms,
+    per_hop_distances_km, per_hop_prop_ms.
+    """
+    if src_idx == dst_idx:
+        return {"success": True, "hops": 0, "total_distance_km": 0.0,
+                "total_prop_ms": 0.0, "per_hop_distances_km": [],
+                "per_hop_prop_ms": []}
+
+    # Dijkstra weighted by prop_delay_ms.
+    dist: Dict[int, float] = {src_idx: 0.0}
+    prev: Dict[int, Tuple[int, float, float]] = {}  # node -> (prev_node, edge_dist_km, edge_prop_ms)
+    pq: List[Tuple[float, int]] = [(0.0, src_idx)]
+
+    while pq:
+        d_u, u = heapq.heappop(pq)
+        if u == dst_idx:
+            break
+        if d_u > dist.get(u, math.inf):
+            continue
+        for v, d_km, prop_ms in graph.get(u, []):
+            new_d = d_u + prop_ms
+            if new_d < dist.get(v, math.inf):
+                dist[v] = new_d
+                prev[v] = (u, d_km, prop_ms)
+                heapq.heappush(pq, (new_d, v))
+
+    if dst_idx not in dist:
+        return {"success": False, "hops": -1, "total_distance_km": float("nan"),
+                "total_prop_ms": float("nan"), "per_hop_distances_km": [],
+                "per_hop_prop_ms": []}
+
+    # Reconstruct path back-to-front.
+    per_d: List[float] = []
+    per_p: List[float] = []
+    cur = dst_idx
+    while cur != src_idx:
+        p_node, e_d, e_p = prev[cur]
+        per_d.append(e_d)
+        per_p.append(e_p)
+        cur = p_node
+    per_d.reverse()
+    per_p.reverse()
+    return {"success": True, "hops": len(per_d),
+            "total_distance_km": float(sum(per_d)),
+            "total_prop_ms": float(sum(per_p)),
+            "per_hop_distances_km": per_d,
+            "per_hop_prop_ms": per_p}
+
+
+def md1_queueing_ms(rho: float, serialisation_ms: float) -> float:
+    """M/D/1 queueing delay: W_q = rho/(2*(1-rho)) * T_s.
+
+    Cap at 50*T_s for rho >= 0.99 to keep numbers finite for plots.
+    """
+    if rho <= 0.0:
+        return 0.0
+    if rho >= 0.99:
+        return serialisation_ms * 50.0
+    return (rho / (2.0 * (1.0 - rho))) * serialisation_ms
+
+
+def greedy_path_distances_km(node_arr: Dict, path_ids: List[str]) -> List[float]:
+    """Per-hop straight-line distances in km for a greedy-routed path."""
+    pos = node_arr["pos"]
+    id_to_idx = node_arr["id_to_idx"]
+    out: List[float] = []
+    for a, b in zip(path_ids[:-1], path_ids[1:]):
+        ai = id_to_idx.get(a)
+        bi = id_to_idx.get(b)
+        if ai is None or bi is None:
+            out.append(float("nan"))
+            continue
+        out.append(float(np.linalg.norm(pos[bi] - pos[ai])))
+    return out
+
+
+def percentile_dict(values: List[float], prefix: str) -> Dict[str, float]:
+    """Return {prefix_p50, prefix_p90, ...} from a list."""
+    out: Dict[str, float] = {}
+    if not values:
+        for p in PERCENTILES:
+            out[f"{prefix}_p{p}"] = float("nan")
+        out[f"{prefix}_mean"] = float("nan")
+        return out
+    arr = np.asarray(values, dtype=float)
+    for p in PERCENTILES:
+        out[f"{prefix}_p{p}"] = float(np.percentile(arr, p))
+    out[f"{prefix}_mean"] = float(np.mean(arr))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -826,14 +1018,23 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
                       meta_step: Optional[Dict],
                       args, rng: random.Random) -> List[Dict]:
     nodes = pd.read_csv(nodes_path)
-    # edges file is loaded for completeness but the empirical routing in
-    # this analysis is geometric (it does not follow the precomputed ISL
-    # graph; it uses the same Wang constraints the analytical model uses).
-    _edges = pd.read_csv(edges_path) if os.path.exists(edges_path) else None
+    edges_df = pd.read_csv(edges_path) if os.path.exists(edges_path) else None
 
     tiers = infer_tiers(nodes)
     if not tiers:
         return []
+
+    # Pre-compute per-hop serialisation delay for queuing, if requested.
+    # T_s = packet_bytes * 8 / link_rate_bps  (in ms)
+    serialisation_ms = 0.0
+    rho = 0.0
+    if args.link_rate_mbps > 0:
+        link_rate_bps = args.link_rate_mbps * 1e6
+        serialisation_ms = (args.packet_bytes * 8.0 / link_rate_bps) * 1000.0
+        if args.offered_load_mbps > 0:
+            offered_bps = args.offered_load_mbps * 1e6
+            rho = min(0.999, offered_bps / link_rate_bps)
+    queueing_ms_per_hop = md1_queueing_ms(rho, serialisation_ms)
 
     K = len(tiers)
     P_I = tier_to_tier_interruption(
@@ -854,6 +1055,10 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
                          args.theta_m,
                          rng, args.endpoint_kind)
 
+    # Build the Dijkstra graph from precomputed ISL edges. This is the
+    # baseline against which greedy routing is measured.
+    isl_graph = build_isl_graph(edges_df, node_arr)
+
     epoch_label = (meta_step or {}).get("iso") or "unknown"
     step = (meta_step or {}).get("step", 0)
 
@@ -873,6 +1078,34 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
     else:
         analytical_theta_m = observed_theta_m
 
+    # Dijkstra baseline (computed once per epoch — strategy-independent).
+    id_to_idx = node_arr["id_to_idx"]
+    dijkstra_success = 0
+    dijkstra_fail = 0
+    dijkstra_hops: List[int] = []
+    dijkstra_prop_ms: List[float] = []
+    dijkstra_total_ms: List[float] = []  # prop + queue
+    dijkstra_dist_km: List[float] = []
+    for (src, dst, _) in pairs:
+        si = id_to_idx.get(src)
+        di = id_to_idx.get(dst)
+        if si is None or di is None:
+            dijkstra_fail += 1
+            continue
+        r = dijkstra_route(isl_graph, si, di)
+        if r["success"]:
+            dijkstra_success += 1
+            dijkstra_hops.append(r["hops"])
+            dijkstra_prop_ms.append(r["total_prop_ms"])
+            dijkstra_dist_km.append(r["total_distance_km"])
+            dijkstra_total_ms.append(
+                r["total_prop_ms"] + queueing_ms_per_hop * r["hops"])
+        else:
+            dijkstra_fail += 1
+    dijkstra_decided = dijkstra_success + dijkstra_fail
+    dijkstra_interruption = (dijkstra_fail / dijkstra_decided
+                              if dijkstra_decided > 0 else float("nan"))
+
     rows: List[Dict] = []
     for sname, s in strategies.items():
         T1 = build_T1(s, P_I)
@@ -889,18 +1122,44 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
         n_interrupt = 0
         success_hops: List[int] = []
         interrupted_hops: List[int] = []
+        greedy_prop_ms: List[float] = []
+        greedy_total_ms: List[float] = []  # prop + queue
+        greedy_dist_km: List[float] = []
         per_pair_rows: List[Dict] = []
+        binding_c1 = 0
+        binding_c2 = 0
+        binding_los = 0
+        binding_none = 0
         for (src, dst, theta_m_pair) in pairs:
             r = simulate_route(node_arr, node_to_tier, tiers, s,
                                src, dst,
                                args.theta_r, args.theta_s, args.d_th_km,
                                max_hops=args.max_hops)
+            pair_prop_ms = float("nan")
+            pair_total_ms = float("nan")
+            pair_dist_km = float("nan")
             if r["success"]:
                 n_success += 1
                 success_hops.append(r["hops"])
+                hop_d = greedy_path_distances_km(node_arr, r["path"])
+                d_sum = float(np.nansum(hop_d))
+                p_sum = d_sum / C_KM_PER_S * 1000.0
+                q_sum = queueing_ms_per_hop * r["hops"]
+                greedy_dist_km.append(d_sum)
+                greedy_prop_ms.append(p_sum)
+                greedy_total_ms.append(p_sum + q_sum)
+                pair_prop_ms = p_sum
+                pair_total_ms = p_sum + q_sum
+                pair_dist_km = d_sum
             elif r["interrupt"]:
                 n_interrupt += 1
                 interrupted_hops.append(r["interrupted_hop"])
+                bd = r.get("failure_breakdown") or {}
+                bc = bd.get("binding_constraint", "none_in_range")
+                if bc == "c1_direction":   binding_c1  += 1
+                elif bc == "c2_dome":      binding_c2  += 1
+                elif bc == "c3_los":       binding_los += 1
+                else:                      binding_none += 1
             if args.write_per_pair:
                 per_pair_rows.append({
                     "epoch_step": step,
@@ -913,6 +1172,9 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
                     "hops": r["hops"],
                     "interrupted_hop": r["interrupted_hop"],
                     "reason": r["reason"],
+                    "greedy_prop_ms": pair_prop_ms,
+                    "greedy_total_ms": pair_total_ms,
+                    "greedy_distance_km": pair_dist_km,
                 })
 
         decided = n_success + n_interrupt
@@ -948,6 +1210,13 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
             "pairs_success": n_success,
             "pairs_interrupted": n_interrupt,
             "empirical_interruption_probability": empirical_p,
+            "binding_c1_direction": binding_c1,
+            "binding_c2_dome":      binding_c2,
+            "binding_c3_los":       binding_los,
+            "binding_none_in_range": binding_none,
+            "binding_c1_pct": round(binding_c1 / n_interrupt * 100, 1) if n_interrupt else float("nan"),
+            "binding_c2_pct": round(binding_c2 / n_interrupt * 100, 1) if n_interrupt else float("nan"),
+            "binding_los_pct": round(binding_los / n_interrupt * 100, 1) if n_interrupt else float("nan"),
             "absolute_error": abs_err,
             "relative_error": rel_err,
             "mean_success_hops": (float(np.mean(success_hops))
@@ -956,6 +1225,39 @@ def analyse_one_epoch(nodes_path: str, edges_path: str,
                                       if interrupted_hops else float("nan")),
             "per_pair_rows": per_pair_rows if args.write_per_pair else None,
         }
+
+        # Greedy hop-count and latency distributions (successful routes).
+        for k, v in percentile_dict(success_hops, "greedy_hops").items():
+            row[k] = v
+        for k, v in percentile_dict(greedy_prop_ms, "greedy_prop_ms").items():
+            row[k] = v
+        for k, v in percentile_dict(greedy_total_ms, "greedy_total_ms").items():
+            row[k] = v
+        for k, v in percentile_dict(greedy_dist_km, "greedy_distance_km").items():
+            row[k] = v
+
+        # Dijkstra baseline metrics (same on every strategy row).
+        row["dijkstra_pairs_total"] = dijkstra_decided
+        row["dijkstra_pairs_success"] = dijkstra_success
+        row["dijkstra_pairs_fail"] = dijkstra_fail
+        row["dijkstra_interruption_probability"] = dijkstra_interruption
+        for k, v in percentile_dict(dijkstra_hops, "dijkstra_hops").items():
+            row[k] = v
+        for k, v in percentile_dict(dijkstra_prop_ms, "dijkstra_prop_ms").items():
+            row[k] = v
+        for k, v in percentile_dict(dijkstra_total_ms, "dijkstra_total_ms").items():
+            row[k] = v
+        for k, v in percentile_dict(dijkstra_dist_km, "dijkstra_distance_km").items():
+            row[k] = v
+
+        # Queuing parameters (same for every row in the run).
+        row["queue_link_rate_mbps"] = args.link_rate_mbps
+        row["queue_offered_load_mbps"] = args.offered_load_mbps
+        row["queue_packet_bytes"] = args.packet_bytes
+        row["queue_rho"] = rho
+        row["queue_serialisation_ms"] = serialisation_ms
+        row["queue_per_hop_ms"] = queueing_ms_per_hop
+
         rows.append(row)
     return rows
 
@@ -992,12 +1294,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                           "default pi/3 keeps pairs reasonably distant given a "
                           "small gateway list."))
     ap.add_argument("--theta_m_mode", choices=("observed", "fixed"),
-                    default="fixed",
+                    default="observed",
                     help=("how to set the theta_m used in the analytical model. "
                           "'observed' uses the mean dome angle of sampled pairs "
-                          "(makes the analytical / empirical comparison "
+                          "(default — makes the analytical / empirical comparison "
                           "apples-to-apples). 'fixed' uses --theta_m verbatim "
-                          "(default, aligns with the paper's theta_m = pi case)."))
+                          "(aligns with the paper's theta_m = pi case but "
+                          "overestimates N_h for short gateway pairs)."))
     ap.add_argument("--d_th_km", type=float, default=DEFAULT_D_TH_KM,
                     help="max single-hop reliable distance (km). default 4000.")
     ap.add_argument("--pairs", type=int, default=200,
@@ -1012,6 +1315,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                           "available, otherwise satellite."))
     ap.add_argument("--write-per-pair", action="store_true",
                     help="also write a per-pair CSV (large for many pairs).")
+    # Queuing model parameters (M/D/1). Set link_rate_mbps and offered_load_mbps
+    # to add per-hop queuing delay to greedy/Dijkstra latency totals.
+    ap.add_argument("--link_rate_mbps", type=float, default=0.0,
+                    help=("ISL link capacity in Mbps. 0 disables queuing. "
+                          "Typical values: 1000 (1 Gbps), 10000 (10 Gbps)."))
+    ap.add_argument("--offered_load_mbps", type=float, default=0.0,
+                    help=("Background offered load on each ISL link in Mbps. "
+                          "rho = offered/rate. 0 disables queuing."))
+    ap.add_argument("--packet_bytes", type=int, default=1500,
+                    help=("Packet size for serialisation/queuing computation "
+                          "(M/D/1 model). Default 1500 (typical IP packet)."))
     return ap.parse_args(argv)
 
 
@@ -1084,6 +1398,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         "absolute_error", "relative_error",
         "pairs_total", "pairs_decided", "pairs_success", "pairs_interrupted",
         "mean_success_hops", "mean_interrupted_hop",
+        # Greedy distributions
+        "greedy_hops_mean", "greedy_hops_p50", "greedy_hops_p90", "greedy_hops_p95", "greedy_hops_p99",
+        "greedy_distance_km_mean", "greedy_distance_km_p50", "greedy_distance_km_p90", "greedy_distance_km_p95", "greedy_distance_km_p99",
+        "greedy_prop_ms_mean", "greedy_prop_ms_p50", "greedy_prop_ms_p90", "greedy_prop_ms_p95", "greedy_prop_ms_p99",
+        "greedy_total_ms_mean", "greedy_total_ms_p50", "greedy_total_ms_p90", "greedy_total_ms_p95", "greedy_total_ms_p99",
+        # Dijkstra baseline
+        "dijkstra_pairs_total", "dijkstra_pairs_success", "dijkstra_pairs_fail",
+        "dijkstra_interruption_probability",
+        "dijkstra_hops_mean", "dijkstra_hops_p50", "dijkstra_hops_p90", "dijkstra_hops_p95", "dijkstra_hops_p99",
+        "dijkstra_distance_km_mean", "dijkstra_distance_km_p50", "dijkstra_distance_km_p90", "dijkstra_distance_km_p95", "dijkstra_distance_km_p99",
+        "dijkstra_prop_ms_mean", "dijkstra_prop_ms_p50", "dijkstra_prop_ms_p90", "dijkstra_prop_ms_p95", "dijkstra_prop_ms_p99",
+        "dijkstra_total_ms_mean", "dijkstra_total_ms_p50", "dijkstra_total_ms_p90", "dijkstra_total_ms_p95", "dijkstra_total_ms_p99",
+        # Queuing parameters
+        "queue_link_rate_mbps", "queue_offered_load_mbps", "queue_packet_bytes",
+        "queue_rho", "queue_serialisation_ms", "queue_per_hop_ms",
     ]
     summary_cols = [c for c in summary_cols if c in df.columns]
     df = df[summary_cols]
@@ -1110,6 +1439,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "seed": args.seed,
             "endpoint_kind": args.endpoint_kind,
             "max_hops": args.max_hops,
+            "link_rate_mbps": args.link_rate_mbps,
+            "offered_load_mbps": args.offered_load_mbps,
+            "packet_bytes": args.packet_bytes,
         },
         "rows": json.loads(df.to_json(orient="records")),
     }

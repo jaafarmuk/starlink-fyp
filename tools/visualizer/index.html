@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Starlink snapshot explorer</title>
+<title>Starlink MHR Visualizer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root {
@@ -20,204 +20,309 @@
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Ubuntu, sans-serif; }
-  #app { display: grid; grid-template-columns: 340px 1fr 320px; height: 100%; }
-  #left, #right { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; }
-  #right { border-right: none; border-left: 1px solid var(--border); }
+  #app { display: grid; grid-template-columns: 310px 1fr; height: 100%; }
+  #left { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; }
   #scene { position: relative; background: #000; }
   canvas { display: block; }
-  h1, h2, h3 { margin: 0 0 6px; font-weight: 600; }
-  h1 { font-size: 16px; letter-spacing: 0.3px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-dim); margin-top: 16px; }
-  h3 { font-size: 12px; color: var(--ink-dim); }
-  .section { padding: 14px 16px; border-bottom: 1px solid var(--border); }
-  label { display: block; font-size: 12px; color: var(--ink-dim); margin-top: 8px; margin-bottom: 4px; }
+  h1 { margin: 0 0 4px; font-weight: 700; font-size: 14px; letter-spacing: 0.3px; color: var(--accent); }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-dim);
+       margin: 0 0 8px; font-weight: 600; }
+  .section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  label { display: block; font-size: 11px; color: var(--ink-dim); margin-top: 6px; margin-bottom: 3px; }
   input[type=number], input[type=range], input[type=text], select {
     width: 100%; background: var(--panel-2); color: var(--ink);
-    border: 1px solid var(--border); padding: 6px 8px; font-size: 12px; border-radius: 4px;
+    border: 1px solid var(--border); padding: 5px 7px; font-size: 11px; border-radius: 4px;
   }
-  input[type=range] { padding: 0; }
+  input[type=range] { padding: 2px 0; cursor: pointer; }
+  input[type=file] { display: none; }
   button { cursor: pointer; background: var(--accent); color: #001622; border: 0;
-    padding: 8px 12px; font-size: 12px; font-weight: 600; border-radius: 4px; width: 100%; }
-  button.secondary { background: var(--panel-2); color: var(--ink); border: 1px solid var(--border); }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
-  .kv { font-size: 12px; padding: 4px 0; border-bottom: 1px dashed var(--border); display: flex; justify-content: space-between; }
-  .kv span:last-child { color: var(--accent); font-variant-numeric: tabular-nums; }
-  .hoplist { font-size: 11px; line-height: 1.4; margin-top: 6px; }
-  .hoplist .hop { padding: 6px 8px; background: var(--panel-2); border-radius: 4px; margin-bottom: 4px; }
-  .hoplist .hop b { color: var(--accent-2); }
-  .legend { font-size: 11px; color: var(--ink-dim); line-height: 1.6; }
-  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  #status { position: absolute; left: 12px; bottom: 12px; background: rgba(0,0,0,0.55);
-    padding: 8px 12px; border-radius: 4px; font-size: 11px; color: var(--ink-dim); }
-  #tooltip { position: absolute; pointer-events: none; background: rgba(0,0,0,0.8);
-    padding: 4px 8px; border-radius: 3px; font-size: 11px; color: var(--ink);
-    display: none; z-index: 10; }
+    padding: 7px 10px; font-size: 11px; font-weight: 700; border-radius: 4px; width: 100%; }
+  button.secondary { background: var(--panel-2); color: var(--ink); border: 1px solid var(--border); font-weight: 500; }
+  button.danger { background: #331010; color: var(--err); border: 1px solid #441818; font-weight: 500; }
+  button.active { background: var(--accent-2); color: #001a10; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .kv { font-size: 11px; padding: 3px 0; border-bottom: 1px dashed var(--border);
+        display: flex; justify-content: space-between; gap: 6px; }
+  .kv span:first-child { color: var(--ink-dim); }
+  .kv span:last-child { color: var(--accent); font-variant-numeric: tabular-nums; text-align: right; }
+  .kv.warn-row span:last-child { color: var(--warn); }
+  .kv.err-row  span:last-child { color: var(--err); }
+  .kv.ok-row   span:last-child { color: var(--accent-2); }
   .muted { color: var(--ink-dim); font-size: 11px; line-height: 1.4; }
-  .pill { display: inline-block; padding: 2px 6px; font-size: 10px;
-          border: 1px solid var(--border); border-radius: 10px; color: var(--ink-dim); margin-right: 4px;}
-  .banner { font-size: 11px; padding: 8px 12px; border-radius: 4px; margin-bottom: 10px; }
-  .banner.warn { background: rgba(255, 179, 71, 0.08); border: 1px solid rgba(255,179,71,0.2); color: var(--warn); }
+  .pill { display: inline-block; padding: 1px 5px; font-size: 10px;
+          border: 1px solid var(--border); border-radius: 10px; color: var(--ink-dim); margin-right: 3px; }
+  .banner { font-size: 11px; padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; }
+  .banner.warn { background: rgba(255,179,71,0.08); border: 1px solid rgba(255,179,71,0.2); color: var(--warn); }
+  .banner.err  { background: rgba(255,106,106,0.08); border: 1px solid rgba(255,106,106,0.2); color: var(--err); }
+  .banner.ok   { background: rgba(138,255,193,0.08); border: 1px solid rgba(138,255,193,0.2); color: var(--accent-2); }
+  .slider-row { display: flex; align-items: center; gap: 6px; }
+  .slider-row input[type=range] { flex: 1; }
+  .slider-val { font-size: 11px; color: var(--accent); font-variant-numeric: tabular-nums;
+                min-width: 52px; text-align: right; }
+  .radio-group { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; }
+  .radio-group label { display: flex; align-items: center; gap: 6px; margin: 0;
+                       color: var(--ink); font-size: 11px; cursor: pointer; }
+  .radio-group input[type=radio] { width: auto; }
+  .section-title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .collapse-btn { background: none; border: none; color: var(--ink-dim); cursor: pointer;
+                  font-size: 11px; padding: 0; width: auto; font-weight: 400; }
+  .collapse-btn:hover { color: var(--ink); }
+
+  /* ── Per-hop table ─────────────────────────────────────────── */
+  .hop-table { margin-top: 5px; width: 100%; }
+  .hop-row { display: grid;
+             grid-template-columns: 20px 1fr 46px 40px 38px;
+             gap: 2px; font-size: 9.5px; font-family: monospace;
+             color: var(--ink-dim); padding: 1.5px 0; line-height: 1.5; align-items: center; }
+  .hop-row.hdr { color: #5a6878; font-size: 9px; text-transform: uppercase;
+                 letter-spacing: 0.4px; border-bottom: 1px solid var(--border);
+                 padding-bottom: 3px; margin-bottom: 2px; }
+  .hop-row .h-ms  { text-align: right; color: var(--accent); }
+  .hop-row .h-km  { text-align: right; }
+  .hop-row .h-rho { text-align: right; }
+  .hop-row.cong   .h-ms { color: var(--warn); }
+  .hop-row.hicong .h-ms { color: var(--err); }
+  .hop-row.int    { color: var(--err); }
+
+  /* ── Comparison grid ───────────────────────────────────────── */
+  .cmp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px; }
+  .cmp-hdr  { font-size: 11px; font-weight: 700; padding-bottom: 4px;
+              border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+  .cmp-hdr.dijk { color: var(--accent); }
+  .cmp-hdr.bpp  { color: #ff77dd; }
+
+  /* ── Verdict box ───────────────────────────────────────────── */
+  .verdict { font-size: 10.5px; padding: 7px 9px; border-radius: 4px;
+             line-height: 1.6; border: 1px solid var(--border); }
+  .verdict.ok   { background: rgba(138,255,193,0.06); border-color: rgba(138,255,193,0.25); }
+  .verdict.warn { background: rgba(255,179,71,0.06);  border-color: rgba(255,179,71,0.25); }
+  .verdict.bad  { background: rgba(255,106,106,0.06); border-color: rgba(255,106,106,0.25); }
+
+  /* ── Tags ──────────────────────────────────────────────────── */
+  .tag { display: inline-block; padding: 0 3px; font-size: 9px;
+         border-radius: 2px; vertical-align: middle; margin-left: 1px; }
+  .tag-isl  { background: rgba(74,214,255,0.10);  color: #4ad6ff; }
+  .tag-acc  { background: rgba(255,100,100,0.10); color: #ff7070; }
+  .tag-syn  { background: rgba(170,100,255,0.10); color: #bb88ff; }
+
+  /* ── Overlay / heatmap ─────────────────────────────────────── */
+  #status { position: absolute; left: 12px; bottom: 12px; background: rgba(0,0,0,0.65);
+    padding: 6px 10px; border-radius: 4px; font-size: 11px; color: var(--ink-dim);
+    pointer-events: none; }
+  #path-overlay { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    background: transparent; padding: 6px 12px; border-radius: 4px; font-size: 12px;
+    color: var(--ink); pointer-events: none; text-align: center;
+    text-shadow: 0 0 8px rgba(0,0,0,0.9), 0 1px 3px rgba(0,0,0,0.8); }
+  #tooltip { position: absolute; pointer-events: none; background: rgba(7,9,13,0.92);
+    border: 1px solid var(--border); padding: 5px 9px; border-radius: 4px;
+    font-size: 11px; color: var(--ink); display: none; z-index: 10; }
+
+  .heat-legend { display: flex; gap: 8px; font-size: 10px; color: var(--ink-dim);
+                 margin-top: 5px; flex-wrap: wrap; align-items: center; }
+  .heat-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+              margin-right: 2px; vertical-align: middle; }
+  #compare-section { display: none; }
 </style>
 </head>
 <body>
 <div id="app">
   <aside id="left">
-    <div class="section">
-      <h1>Starlink Snapshot Explorer</h1>
-      <div class="muted" style="margin-top:6px">
-        Loads <code>results/snapshot_nodes.csv</code> &amp;
-        <code>results/snapshot_edges.csv</code> and lets you inject traffic
-        to see how packets traverse the constellation.
+
+    <!-- 1. Title -->
+    <div class="section" style="padding-bottom:10px">
+      <h1>Starlink MHR Visualizer</h1>
+      <div class="muted" style="font-size:10px;margin-top:2px">
+        Multi-Hop Routing &middot; BPP constraints &middot; 3D ECEF &middot; Real TLE data
       </div>
     </div>
 
+    <!-- 2. Snapshot + Epoch -->
     <div class="section">
       <h2>Snapshot</h2>
-      <div id="meta-info" class="muted">loading&hellip;</div>
+      <div id="meta-info" class="muted" style="margin-bottom:8px">loading&hellip;</div>
+      <label>Satellite count (performance vs. accuracy)</label>
+      <select id="sat-count-select" style="margin-bottom:6px">
+        <option value="200">200 satellites — fastest</option>
+        <option value="600">600 satellites — fast (matches early experiment)</option>
+        <option value="1500">1500 satellites — medium</option>
+        <option value="0" selected>All 4080 satellites — full real dataset</option>
+      </select>
+      <div class="muted" style="font-size:10px;margin-bottom:7px">
+        Lower counts subsample randomly — faster rendering but partially destroys
+        Walker-delta lane structure, making BPP predictions less accurate.
+      </div>
+      <label>Time window (epoch)</label>
+      <select id="epoch-select" style="margin-bottom:4px"></select>
+      <div class="muted" style="font-size:10px;margin-bottom:7px">
+        Satellites move between epochs (9-min steps). Switch to reload ISL topology.
+      </div>
+      <button class="secondary" id="file-load-btn"
+              onclick="document.getElementById('file-input').click()">
+        Load local CSVs&hellip;
+      </button>
+      <input type="file" id="file-input" multiple accept=".csv,.json" />
     </div>
 
+    <!-- 3. Route -->
     <div class="section">
-      <h2>Traffic source &amp; destination</h2>
-      <label>Source node</label>
-      <select id="src-select"></select>
-      <label>Destination node</label>
-      <select id="dst-select"></select>
+      <h2>Route</h2>
+      <label>Source</label>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:5px">
+        <select id="src-select"></select>
+        <button id="locate-src" class="secondary" title="Fly to source"
+                style="width:auto;padding:4px 8px">&#9737;</button>
+      </div>
+      <label>Destination</label>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:5px">
+        <select id="dst-select"></select>
+        <button id="locate-dst" class="secondary" title="Fly to destination"
+                style="width:auto;padding:4px 8px">&#9737;</button>
+      </div>
       <div class="row" style="margin-top:8px">
-        <button id="pick-src" class="secondary">Pick src on map</button>
-        <button id="pick-dst" class="secondary">Pick dst on map</button>
+        <button id="pick-src" class="secondary">Pick on globe (src)</button>
+        <button id="pick-dst" class="secondary">Pick on globe (dst)</button>
+      </div>
+      <button id="random-pair" class="secondary" style="margin-top:6px">Random pair</button>
+    </div>
+
+    <!-- 4. Routing method -->
+    <div class="section">
+      <h2>Routing method</h2>
+      <div class="radio-group">
+        <label>
+          <input type="radio" name="routing" id="route-dijkstra" value="dijkstra" checked />
+          Dijkstra — shortest delay (fixed ISL graph)
+        </label>
+        <label>
+          <input type="radio" name="routing" id="route-bpp" value="bpp" />
+          BPP Paper — greedy Wang routing (c1/c2/c3)
+        </label>
       </div>
     </div>
 
+    <!-- 5. Traffic model -->
     <div class="section">
-      <h2>Packet &amp; link parameters</h2>
+      <h2>Traffic model</h2>
       <div class="row">
         <div>
           <label>Packet size (B)</label>
           <input id="packet-size" type="number" min="64" max="65535" value="1000" />
         </div>
         <div>
-          <label>ISL link rate (Mbps)</label>
+          <label>Link rate (Mbps)</label>
           <input id="link-rate" type="number" min="1" max="100000" step="1" value="20" />
         </div>
       </div>
-      <div class="row">
+      <div class="row" style="margin-top:4px">
         <div>
-          <label>Access link rate (Mbps)</label>
-          <input id="access-rate" type="number" min="1" max="100000" step="1" value="100" />
+          <label>Background load (Mbps)</label>
+          <input id="offered-load" type="number" min="0" max="100000" step="0.1" value="0"
+            title="Background traffic sets ρ and M/D/1 queuing delay. 0 = no queuing." />
         </div>
         <div>
-          <label>Queue size (pkts)</label>
-          <input id="queue-size" type="number" min="1" max="100000" value="100" />
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label>Offered load (Mbps, 0 = saturating)</label>
-          <input id="offered-load" type="number" min="0" max="100000" step="0.1" value="0" />
-        </div>
-        <div>
-          <label>Per-link loss probability</label>
-          <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0.005" />
+          <label>Loss prob / link</label>
+          <input id="loss-probability" type="number" min="0" max="1" step="0.001" value="0" />
         </div>
       </div>
-      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
-        <input id="retransmit" type="checkbox" />
-        TCP-style retransmit on loss (animation only)
-      </label>
-      <div class="muted" style="margin-top:6px">
-        Offered load = 0 uses the path bottleneck as the offered rate, which
-        forces ρ≈1 on the bottleneck hop. Set a positive value to see
-        sub-saturation behaviour. The per-link loss drop is Bernoulli and,
-        by default, the packet is simply lost — toggle retransmit above
-        for a simplified TCP-like behaviour. This is a teaching
-        animation, not a TCP stack.
+      <div class="muted" style="font-size:10px;margin-top:4px">
+        Queuing model: M/D/1 &middot; &rho;&nbsp;=&nbsp;load/rate &middot;
+        W<sub>q</sub>&nbsp;=&nbsp;&rho;/(2(1&minus;&rho;))&times;T<sub>s</sub>
       </div>
     </div>
 
+    <!-- 6. Speed -->
     <div class="section">
-      <h2>Launch</h2>
-      <div class="row">
-        <button id="launch">Send packet</button>
-        <button id="launch-burst" class="secondary">Burst (50)</button>
+      <h2>Animation speed</h2>
+      <div class="slider-row">
+        <input type="range" id="time-scale" min="0.1" max="10" step="0.1" value="1" />
+        <span class="slider-val" id="time-scale-label">1×</span>
       </div>
-      <div class="row" style="margin-top:6px">
-        <button id="steady" class="secondary">Start steady load</button>
-        <button id="stop" class="secondary">Stop traffic</button>
+      <div class="muted" style="font-size:10px;margin-top:3px">1× ≈ 1.5 s/hop.</div>
+    </div>
+
+    <!-- 7. Actions -->
+    <div class="section">
+      <div class="row" style="margin-bottom:6px">
+        <button id="launch">&#9654; Send Packet</button>
+        <button id="launch-burst" class="secondary">Burst ×20</button>
       </div>
-      <div class="muted" style="margin-top:6px">
-        Packets are routed by Dijkstra on propagation delay.
-        Per-hop queueing and serialization are estimated from the current
-        offered load and link rate.
+      <button id="compare" class="secondary" style="margin-bottom:6px;
+        background:linear-gradient(90deg,#0a3a55,#3a0a55);color:#fff;font-weight:600">
+        &#8646; Compare Dijkstra vs BPP Paper
+      </button>
+      <button id="stop" class="danger">&#9632; Stop all</button>
+    </div>
+
+    <!-- 8. Advanced — collapsible -->
+    <div class="section">
+      <div class="section-title-row" style="cursor:pointer" id="adv-header">
+        <h2 style="margin:0">BPP Parameters</h2>
+        <button class="collapse-btn" id="adv-toggle">&#9654; show</button>
+      </div>
+      <div id="adv-body" style="display:none">
+        <div class="muted" style="font-size:10px;margin-bottom:6px">
+          c1/c2/c3 from Wang et al. (2023). Applied in BPP routing and analytical model.
+        </div>
+        <label>&theta;<sub>r</sub> — direction limit (c1)</label>
+        <div class="slider-row">
+          <input type="range" id="bpp-theta-r" min="10" max="90" step="1" value="45" />
+          <span class="slider-val" id="bpp-theta-r-val">45°</span>
+        </div>
+        <label>&theta;<sub>s</sub> — dome min angle (c2)</label>
+        <div class="slider-row">
+          <input type="range" id="bpp-theta-s" min="5" max="40" step="1" value="15" />
+          <span class="slider-val" id="bpp-theta-s-val">15°</span>
+        </div>
+        <label>d<sub>th</sub> — max hop distance (c3)</label>
+        <div class="slider-row">
+          <input type="range" id="bpp-dth" min="1000" max="7000" step="100" value="5000" />
+          <span class="slider-val" id="bpp-dth-val">5000 km</span>
+        </div>
+        <label>Tier priority strategy</label>
+        <select id="bpp-strategy">
+          <option value="density">density (paper default)</option>
+          <option value="single_hop">single_hop</option>
+        </select>
       </div>
     </div>
 
+    <!-- 9. Last Packet -->
     <div class="section">
-      <h2>View</h2>
-      <label>Speed-up vs real time</label>
-      <input id="time-scale" type="range" min="1" max="2000" step="1" value="200" />
-      <div class="muted"><span id="time-scale-label">200x</span> — 1x means packets take their physical delay, 200x shrinks tens of ms into ~50 ms of screen time.</div>
-      <div class="row" style="margin-top:8px">
-        <label style="display:flex;align-items:center;gap:6px;margin:0">
-          <input id="show-isl" type="checkbox" checked /> show ISL edges
-        </label>
-        <label style="display:flex;align-items:center;gap:6px;margin:0">
-          <input id="show-access" type="checkbox" checked /> show access links
-        </label>
-      </div>
-      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
-        <input id="auto-rotate" type="checkbox" /> auto-rotate earth
-      </label>
+      <h2>Last Packet</h2>
+      <div id="path-info" class="muted">no packet sent yet</div>
     </div>
+
+    <!-- 10. Comparison results -->
+    <div class="section" id="compare-section">
+      <h2>Comparison</h2>
+      <div id="compare-results"></div>
+    </div>
+
+    <!-- 11. Session stats -->
+    <div class="section">
+      <h2>Session Stats</h2>
+      <div id="metrics" class="muted"></div>
+      <div class="heat-legend" style="margin-top:6px">
+        <span>Link heat:</span>
+        <span><span class="heat-dot" style="background:#1b3650"></span>0</span>
+        <span><span class="heat-dot" style="background:#4ad6ff"></span>1–3</span>
+        <span><span class="heat-dot" style="background:#ffb347"></span>4–15</span>
+        <span><span class="heat-dot" style="background:#ff6a6a"></span>16+</span>
+      </div>
+      <button id="reset-heatmap" class="secondary"
+              style="margin-top:8px;font-size:10px;padding:5px 8px">
+        Reset heatmap &amp; stats
+      </button>
+    </div>
+
   </aside>
 
   <div id="scene">
     <div id="tooltip"></div>
     <div id="status">initialising&hellip;</div>
+    <div id="path-overlay"></div>
   </div>
-
-  <aside id="right">
-    <div class="section">
-      <h2>Selected flow</h2>
-      <div id="flow-summary" class="muted">no flow yet</div>
-    </div>
-    <div class="section">
-      <h2>Hop-by-hop breakdown</h2>
-      <div id="hoplist" class="hoplist"></div>
-    </div>
-    <div class="section">
-      <h2>Aggregate metrics</h2>
-      <div id="metrics" class="muted"></div>
-    </div>
-    <div class="section">
-      <h2>Legend</h2>
-      <div class="legend">
-        <div><span class="dot" style="background:#9ad8ff"></span> intra-plane ISL</div>
-        <div><span class="dot" style="background:#ffe08a"></span> inter-plane ISL</div>
-        <div><span class="dot" style="background:#ff7171"></span> ground access link</div>
-        <div><span class="dot" style="background:#8affc1"></span> satellite</div>
-        <div><span class="dot" style="background:#ff4763"></span> gateway / ground station</div>
-        <div><span class="dot" style="background:#ffffff"></span> selected source / destination</div>
-      </div>
-    </div>
-    <div class="section">
-      <h2>Notes</h2>
-      <div class="muted">
-        Positions are the ECEF projection from the snapshot (a frozen-time
-        view). Propagation delays match the generator's output and are
-        one-way vacuum speed-of-light — not ping latency. Serialization
-        and queueing are <em>derived here</em> from your packet size, link
-        rate, and offered load; they are not FlowMonitor truth.
-        <br/><br/>
-        Ground stations labelled <code>GW-DEMO-*</code> are built-in demo
-        placeholders (city centroids), NOT real Starlink gateway sites.
-        For a physically meaningful study, regenerate with
-        <code>--gateways_csv</code> pointing at an authoritative list.
-        For real ns-3 numbers run <code>tools/run_ns3_snapshot.sh</code>.
-      </div>
-    </div>
-  </aside>
 </div>
 
 <script type="importmap">

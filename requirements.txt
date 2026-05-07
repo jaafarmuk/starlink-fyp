@@ -1,7 +1,20 @@
-# Python dependencies for snapshot generation and plotting.
-# ns-3 is a separate simulator and is not installed through pip.
+# Python dependencies — install once with: pip install -r requirements.txt
+# After this, all project scripts (snapshot generation, analysis, plotting) work.
+# NS-3 is a separate C++ simulator and is NOT installed through pip.
 
+# Satellite propagation (TLE → ECEF positions)
+skyfield>=1.46
+
+# Core scientific stack
 numpy>=1.26
+scipy>=1.11
 pandas>=2.0
-sgp4>=2.23
+
+# Plotting
 matplotlib>=3.8
+
+# Graph connectivity validation (used in snapshot generation)
+networkx>=3.0
+
+# SGP4 propagator (used internally by skyfield; also needed standalone)
+sgp4>=2.23

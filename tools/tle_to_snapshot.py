@@ -500,6 +500,7 @@ def select_shell_population(
     mode: str,
     inc_tol_deg: float,
     alt_tol_km: float,
+    min_alt_sep_km: float = 50.0,
 ) -> tuple[list[tuple[str, str, str]], list[Satrec], dict]:
     """Optionally reduce the candidate population to one or more coherent shells.
 
@@ -507,8 +508,19 @@ def select_shell_population(
     operational shells. The ISL model is same-shell, so a 400-satellite sample
     spread across many shells is expected to fragment. Selecting the largest
     shell keeps the sample physically coherent while still using real TLEs.
-    Selecting the top two shells enables a meaningful 3-tier experiment:
-    gateway + two substantial satellite shells.
+
+    Modes:
+      'largest'         — the single most-populated shell.
+      'top2'            — the two most-populated shells (by raw count).
+                          Warning: may select shells that are nearly identical
+                          in altitude if the two biggest shells happen to be
+                          close together (e.g. both ~480 km).
+      'top2_separated'  — the most-populated shell, plus the most-populated
+                          OTHER shell whose mean altitude differs by at least
+                          `min_alt_sep_km` (default 50 km). This guarantees
+                          genuinely distinct satellite tiers for the K=3
+                          analytical comparison. Falls back to 'top2' if no
+                          sufficiently separated second shell exists.
     """
     if mode == "none":
         return list(sats), list(satrecs), {
@@ -517,7 +529,7 @@ def select_shell_population(
             "selected_tles": len(sats),
         }
 
-    if mode not in {"largest", "top2"}:
+    if mode not in {"largest", "top2", "top2_separated"}:
         raise ValueError(f"Unknown shell selection mode: {mode}")
 
     features: list[tuple[int, dict]] = []
@@ -553,13 +565,54 @@ def select_shell_population(
         ),
         reverse=True,
     )
-    n_select = 1 if mode == "largest" else 2
-    if len(shell_groups) < n_select:
-        raise SystemExit(
-            f"Requested shell selection mode {mode!r}, but only "
-            f"{len(shell_groups)} candidate shells were found.")
 
-    selected_groups = [sorted(g) for g in shell_groups[:n_select]]
+    def mean_alt(g: list[int]) -> float:
+        return float(np.mean([by_index[i]["perigee_alt_km"] for i in g]))
+
+    if mode == "largest":
+        n_select = 1
+        if len(shell_groups) < 1:
+            raise SystemExit("No candidate shells found.")
+        selected_groups = [sorted(shell_groups[0])]
+
+    elif mode == "top2":
+        n_select = 2
+        if len(shell_groups) < 2:
+            raise SystemExit(
+                f"Requested shell selection mode {mode!r}, but only "
+                f"{len(shell_groups)} candidate shells were found.")
+        selected_groups = [sorted(g) for g in shell_groups[:2]]
+
+    else:  # top2_separated
+        if len(shell_groups) < 1:
+            raise SystemExit("No candidate shells found.")
+        first = shell_groups[0]
+        first_alt = mean_alt(first)
+        # Among remaining shells (already sorted by size descending), pick the
+        # largest one whose mean altitude differs from the first by >= min_alt_sep_km.
+        second = None
+        for g in shell_groups[1:]:
+            if abs(mean_alt(g) - first_alt) >= min_alt_sep_km:
+                second = g
+                break
+        if second is None:
+            print(
+                f"WARNING: top2_separated could not find a second shell with "
+                f">={min_alt_sep_km:.0f} km altitude separation. "
+                f"Falling back to top2 (shells may be close in altitude).",
+                file=sys.stderr,
+            )
+            if len(shell_groups) < 2:
+                raise SystemExit("Only one candidate shell; cannot select top2.")
+            second = shell_groups[1]
+        alt_sep = abs(mean_alt(first) - mean_alt(second))
+        print(
+            f"top2_separated: selected shell altitudes "
+            f"{first_alt:.1f} km and {mean_alt(second):.1f} km "
+            f"(separation {alt_sep:.1f} km, min required {min_alt_sep_km:.0f} km)."
+        )
+        selected_groups = [sorted(first), sorted(second)]
+
     chosen = [i for g in selected_groups for i in g]
 
     def shell_summary(g: list[int]) -> dict:
@@ -603,8 +656,8 @@ def sample_selected_population(
 ) -> tuple[list[tuple[str, str, str]], list[Satrec]]:
     """Sample from a selected population.
 
-    For multi-shell selections (currently `top2`), random sampling is
-    stratified across the selected shell blocks so both shells remain present
+    For multi-shell selections (`top2` and `top2_separated`), random sampling
+    is stratified across the selected shell blocks so both shells remain present
     in the final snapshot and the downstream tier analysis sees a meaningful
     multi-tier case.
     """
@@ -614,7 +667,7 @@ def sample_selected_population(
 
     mode = selection_meta.get("mode")
     group_sizes = list(selection_meta.get("selected_group_sizes", []))
-    if mode == "top2" and len(group_sizes) >= 2:
+    if mode in ("top2", "top2_separated") and len(group_sizes) >= 2:
         groups: list[list[int]] = []
         start = 0
         for sz in group_sizes:
@@ -1230,15 +1283,21 @@ def parse_args() -> argparse.Namespace:
                          "the earliest launch IDs, which massively over-"
                          "represents a handful of shells and creates "
                          "fragmented topologies for small --n.")
-    ap.add_argument("--shell_select", choices=["largest", "top2", "none"],
+    ap.add_argument("--shell_select", choices=["largest", "top2", "top2_separated", "none"],
                     default="largest",
-                    help="Select a coherent shell before sampling. The "
-                         "default 'largest' is the realistic choice for "
-                         "limited-size experiments because this project "
-                         "models same-shell ISLs. Use 'top2' to build a "
-                         "meaningful 3-tier case (gateway + two satellite "
-                         "shells). Use 'none' only when you intentionally "
-                         "want a multi-shell population.")
+                    help="Select a coherent shell before sampling. "
+                         "'largest' (default): the single most-populated shell. "
+                         "'top2': the two most-populated shells — WARNING: may "
+                         "pick shells that are nearly identical in altitude. "
+                         "'top2_separated': the most-populated shell plus the "
+                         "most-populated OTHER shell that is >=50 km different "
+                         "in altitude — recommended for a genuine K=3 tier "
+                         "experiment. "
+                         "'none': use all shells (likely to fragment).")
+    ap.add_argument("--min_alt_sep_km", type=float, default=50.0,
+                    help="Minimum altitude separation (km) between the two "
+                         "shells chosen by --shell_select top2_separated. "
+                         "Default 50 km.")
     ap.add_argument("--seed", type=int, default=None)
 
     # Operational-satellite filters (review: TLE dataset mixes operational,
@@ -1673,6 +1732,7 @@ def main():
         mode=args.shell_select,
         inc_tol_deg=args.inc_tol_deg,
         alt_tol_km=args.alt_tol_km,
+        min_alt_sep_km=args.min_alt_sep_km,
     )
     if args.shell_select != "none":
         sels = shell_selection.get("selected_shells", [shell_selection["selected_shell"]])
