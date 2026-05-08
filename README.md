@@ -492,7 +492,7 @@ Then:
 {recentBits_e \over \tau C_e}
 ```
 
-Access links and ISL links can use different capacities.
+In the visualizer, `C_e` is the selected link rate.
 
 ### 20. Visualizer congestion loss curve
 

@@ -30,7 +30,11 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Plot Wang reliability comparison results.")
     ap.add_argument("--summary_csv",
-                    default="results/mhr_reliability_summary.csv")
+                    default=None,
+                    help="Path to summary CSV (from analyze_mhr_reliability.py)")
+    ap.add_argument("--summary",
+                    default=None,
+                    help="Path to summary JSON (from analyze_mhr_reliability.py)")
     ap.add_argument("--out_dir", default="results")
     return ap.parse_args()
 
@@ -115,15 +119,45 @@ def plot_by_strategy(df: pd.DataFrame, path: str) -> None:
     plt.close(fig)
 
 
-def main() -> int:
-    args = parse_args()
-    if not os.path.exists(args.summary_csv):
-        print(f"ERROR: summary file {args.summary_csv} does not exist. "
+def load_summary(args) -> pd.DataFrame:
+    """Load summary from JSON (--summary) or CSV (--summary_csv), auto-detect."""
+    import json
+
+    # Resolve which path to use
+    json_path = args.summary if args.summary else None
+    csv_path  = args.summary_csv if args.summary_csv else None
+
+    # If a JSON path was given (or inferred by extension), load it
+    if json_path and json_path.endswith(".json"):
+        if not os.path.exists(json_path):
+            print(f"ERROR: {json_path} does not exist.", file=sys.stderr)
+            sys.exit(2)
+        with open(json_path) as f:
+            data = json.load(f)
+        rows = data.get("rows", [])
+        if not rows:
+            print(f"ERROR: no 'rows' key in {json_path}.", file=sys.stderr)
+            sys.exit(2)
+        return pd.DataFrame(rows)
+
+    # Fall back to CSV
+    if csv_path is None:
+        # Default: look for the canonical output CSV alongside the JSON
+        csv_path = "results/mhr_optA_summary.csv"
+
+    if not os.path.exists(csv_path):
+        print(f"ERROR: summary file {csv_path} does not exist. "
               "Run tools/analyze_mhr_reliability.py first.",
               file=sys.stderr)
-        return 2
+        return None
+    return pd.read_csv(csv_path)
 
-    df = pd.read_csv(args.summary_csv)
+
+def main() -> int:
+    args = parse_args()
+    df = load_summary(args)
+    if df is None:
+        return 2
     os.makedirs(args.out_dir, exist_ok=True)
     overview = os.path.join(args.out_dir, "mhr_reliability_overview.png")
     error = os.path.join(args.out_dir, "mhr_reliability_error.png")

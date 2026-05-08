@@ -1,1 +1,0 @@
-../../tools/generate_snapshot.sh

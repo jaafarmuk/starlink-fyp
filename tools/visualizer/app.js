@@ -172,7 +172,6 @@ const state = {
   // Per-edge live state
   edgeLoad:        null,     // Float32Array per edge (0..1) — derived from edgeRecentBits
   edgeRecentBits:  null,     // Float32Array — EMA accumulator of offered bits (last τ seconds)
-  edgeIsAccess:    null,     // Uint8Array — 1 if edge is gateway access link, 0 otherwise
 };
 
 // Precomputed flat position arrays for fast BPP scanning
@@ -286,9 +285,6 @@ const ui = {
   advBody:        document.getElementById('adv-body'),
   packetSize:     document.getElementById('packet-size'),
   linkRate:       document.getElementById('link-rate'),
-  offeredLoad:    document.getElementById('offered-load'),
-  gatewayRate:    document.getElementById('gateway-rate'),
-  lossProb:       document.getElementById('loss-probability'),
   launch:         document.getElementById('launch'),
   launchBurst:    document.getElementById('launch-burst'),
   stop:           document.getElementById('stop'),
@@ -474,9 +470,28 @@ function precomputeNodePositions() {
   NODE_KIND = new Array(N);
   for (let i = 0; i < N; i++) {
     const n = state.nodes[i];
-    NPX[i] =  n.ecef[0] * ECEF_SCENE_SCALE;
-    NPY[i] =  n.ecef[2] * ECEF_SCENE_SCALE;
-    NPZ[i] = -n.ecef[1] * ECEF_SCENE_SCALE;
+    let px =  n.ecef[0] * ECEF_SCENE_SCALE;
+    let py =  n.ecef[2] * ECEF_SCENE_SCALE;
+    let pz = -n.ecef[1] * ECEF_SCENE_SCALE;
+
+    // Ground stations are stored in ECEF with the true ellipsoidal Earth
+    // (polar radius ≈ 6357 km), but our collision sphere uses the equatorial
+    // radius (6378.137 km).  High-latitude gateways therefore fall slightly
+    // *inside* the sphere, causing hasLoSFlat() to report every LoS blocked.
+    // Fix: clamp gateway positions radially to the sphere surface so the LoS
+    // geometry is consistent.  Satellite positions are unaffected (they are
+    // always 480–570 km above the surface).
+    if (n.kind === 'gateway') {
+      const r = Math.sqrt(px*px + py*py + pz*pz);
+      if (r > 1e-9 && r < EARTH_SCENE_R) {
+        const s = EARTH_SCENE_R / r;
+        px *= s; py *= s; pz *= s;
+      }
+    }
+
+    NPX[i] = px;
+    NPY[i] = py;
+    NPZ[i] = pz;
     NODE_KIND[i] = n.kind;
   }
 }
@@ -583,10 +598,6 @@ function addSceneObjects() {
 
   state.edgeLoad       = new Float32Array(E);
   state.edgeRecentBits = new Float32Array(E);
-  state.edgeIsAccess   = new Uint8Array(E);
-  for (let i = 0; i < E; i++) {
-    state.edgeIsAccess[i] = state.edges[i].kind === 'access' ? 1 : 0;
-  }
 
   // ── Nodes: gateways individual, satellites instanced ───────────────
   satInstanceToNodeId = [];
@@ -771,7 +782,6 @@ function locateNode(idx, pullback = 9) {
 //   • each visible flow represents demandMultiplier real packets
 //   • per-edge recent offered bits are tracked with an EMA window
 //   • per-edge ρ = recent_offered_bps / edge_capacity_bps
-//   • access links use a lower gateway capacity than ISL trunks
 //   • queuing delay is estimated per hop via M/D/1 in hopCostsForPath()
 //   • packet loss rises smoothly at high ρ to approximate buffer pressure
 
@@ -791,7 +801,7 @@ const TRAFFIC_PRESETS = {
   high:   { rate: 80,  demand: 1700,  cap: 320  },
   stress: { rate: 160, demand: 2800,  cap: 500  },
 };
-const TRAFFIC_TAU_S      = 1.5;     // EMA window for offered-load (seconds)
+const TRAFFIC_TAU_S      = 1.5;     // EMA window for live traffic load (seconds)
 const TRAFFIC_HOP_VIS_MS = 280;     // visual ms per hop for background flows
 const TRAFFIC_MAX_RENDER = 120;     // cap on visible flow sprites
 const THROUGHPUT_WINDOW_MS = 5000;  // window for goodput calc (5 s)
@@ -808,8 +818,10 @@ function lossProbFromRho(rho) {
 }
 
 function edgeCapacityBps(eIdx, params) {
+  // Gateway access links use a separate (lower) capacity to model the
+  // last-mile bottleneck between ground station and the satellite network.
   if (eIdx >= 0 && state.edgeIsAccess && state.edgeIsAccess[eIdx]) {
-    return params.gatewayMbps * 1e6;
+    return (params.gatewayMbps ?? params.islMbps) * 1e6;
   }
   return params.islMbps * 1e6;
 }
@@ -937,8 +949,6 @@ function stepTrafficFlows(dtMs) {
   // ── Sliding-window EMA decay ────────────────────────────────────────
   // Each edge accumulates "offered bits" — we decay each frame and divide
   // by τ to get an instantaneous offered-bps. ρ is offered / capacity.
-  // Gateway access links use their own (lower) capacity, making them
-  // visible bottlenecks independent of ISL trunk utilisation.
   const decay    = Math.exp(-dtMs / 1000 / TRAFFIC_TAU_S);
   const rb       = state.edgeRecentBits;
   const E        = rb.length;
@@ -1311,11 +1321,8 @@ function findEdgeIndex(u, v) {
 
 function readParams() {
   return {
-    packetBytes:  Math.max(1, Number(ui.packetSize.value)),
-    islMbps:      Math.max(0.001, Number(ui.linkRate.value)),
-    gatewayMbps:  Math.max(0.001, Number(ui.gatewayRate?.value || 25)),
-    lossProb:     Math.max(0, Math.min(1, Number(ui.lossProb.value))),
-    offeredMbps:  Math.max(0, Number(ui.offeredLoad.value) || 0),
+    packetBytes:  Math.max(1, Number(ui.packetSize?.value || 1000)),
+    islMbps:      Math.max(0.001, Number(ui.linkRate?.value || 100)),
   };
 }
 
@@ -1330,7 +1337,6 @@ function md1QueueMs(rho, serMs) {
 function hopCostsForPath(path, edgeIdxPath, params) {
   const rows = [];
   let totMs = 0, totProp = 0, totSer = 0, totQueue = 0;
-  const offeredBps = params.offeredMbps * 1e6;
   // Live ρ comes from the background-traffic congestion engine when ON
   const useLive    = state.traffic && state.traffic.on && state.edgeLoad;
 
@@ -1354,18 +1360,12 @@ function hopCostsForPath(path, edgeIdxPath, params) {
       edgeKind   = 'bpp_synthetic';
     }
 
-    const syntheticGatewayHop = eIdx === -1 &&
-      (NODE_KIND[path[i]] === 'gateway' || NODE_KIND[path[i + 1]] === 'gateway');
-    const capacityBps = syntheticGatewayHop
-      ? params.gatewayMbps * 1e6
-      : edgeCapacityBps(eIdx, params);
+    const capacityBps = edgeCapacityBps(eIdx, params);
 
-    // Per-hop ρ: combine static slider load with the live congestion of THIS edge.
-    // The static load is interpreted per edge, so gateway links use gateway capacity.
-    const staticRho = Math.min(0.999, offeredBps > 0 ? offeredBps / capacityBps : 0);
-    let edgeRho = staticRho;
+    // Per-hop ρ comes from live background traffic on this edge.
+    let edgeRho = 0;
     if (useLive && eIdx !== -1 && eIdx < state.edgeLoad.length) {
-      edgeRho = Math.min(0.999, Math.max(staticRho, state.edgeLoad[eIdx]));
+      edgeRho = Math.min(0.999, state.edgeLoad[eIdx]);
     }
     if (edgeRho > rhoMax) rhoMax = edgeRho;
 
@@ -1387,7 +1387,7 @@ function hopCostsForPath(path, edgeIdxPath, params) {
 
   const rho = rhoMax;
   return { rows, totalMs: totMs, totalPropMs: totProp, totalSerMs: totSer,
-           totalQueueMs: totQueue, rho, rhoMax, offeredBps };
+           totalQueueMs: totQueue, rho, rhoMax };
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,17 +1689,17 @@ function launchPacket() {
   scene.add(pktGrp);
   state.activePacket = pktGrp;
 
-  // Per-link loss: combine the static slider and the live ρ-based loss model.
+  // Per-link loss comes from the live ρ-based congestion model.
   // Applied to BOTH Dijkstra and BPP packets when traffic is ON.
   const params  = readParams();
   const useLive = state.traffic && state.traffic.on && state.edgeLoad;
   let dropIndex = -1;
   for (let i = 0; i < routePath.length - 1; ++i) {
-    let p = params.lossProb;
+    let p = 0;
     if (useLive) {
       const eIdx = routeEdgeIdx[i];
       if (eIdx >= 0 && eIdx < state.edgeLoad.length) {
-        p = Math.max(p, lossProbFromRho(state.edgeLoad[eIdx]));
+        p = lossProbFromRho(state.edgeLoad[eIdx]);
       }
     }
     if (p > 0 && Math.random() < p) { dropIndex = i; break; }
@@ -1737,11 +1737,11 @@ function launchBurst(n) {
   for (let k = 0; k < n; ++k) {
     let drop = -1;
     for (let i = 0; i < hops; ++i) {
-      let p = params.lossProb;
+      let p = 0;
       if (useLive) {
         const eIdx = r.edgeIdxPath[i];
         if (eIdx >= 0 && eIdx < state.edgeLoad.length) {
-          p = Math.max(p, lossProbFromRho(state.edgeLoad[eIdx]));
+          p = lossProbFromRho(state.edgeLoad[eIdx]);
         }
       }
       if (p > 0 && Math.random() < p) { drop = i; break; }
@@ -1876,7 +1876,7 @@ function stepActivePacket(dtMs) {
       addRecentEdgeDemand(eIdx, readParams().packetBytes * 8);
     }
 
-    // Bernoulli loss from the static slider and live rho-based congestion.
+    // Bernoulli loss from live rho-based congestion.
     if (p.dropIndex !== -1 && done >= p.dropIndex) {
       markHopFailed(done);
       setPacketColor(state.activePacket, 0xff3333);
@@ -2007,8 +2007,7 @@ function showCompareResults(d, b) {
       `At full Starlink density (4 080 sats), empirical interruption ~78.6%; BPP predicts only ~1.4% -- a 77pp gap.`;
   } else if (!d.delivered && b.delivered) {
     verdictClass = 'warn';
-    verdictText = `Dijkstra had link loss; BPP delivered (loss prob = ${
-      (Number(ui.lossProb.value) * 100).toFixed(1)}%).`;
+    verdictText = `Dijkstra had congestion loss; BPP delivered.`;
   } else {
     verdictClass = 'bad';
     verdictText = `Both failed. ${!d.delivered ? 'Dijkstra: ' + d.reason + '. ' : ''}` +
@@ -2500,7 +2499,7 @@ function wireUi() {
     ui.timeScaleLabel.textContent = state.timeScale.toFixed(1) + '×';
   });
 
-  for (const el of [ui.packetSize, ui.linkRate, ui.gatewayRate, ui.offeredLoad, ui.lossProb]) {
+  for (const el of [ui.packetSize, ui.linkRate, ui.gatewayRate]) {
     if (!el) continue;
     el.addEventListener('change', refreshPath);
     el.addEventListener('input',  refreshPath);
