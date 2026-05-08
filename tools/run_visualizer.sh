@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Serve the interactive snapshot visualizer on http://localhost:8000/
-# Needs: any generated results/snapshot_nodes.csv and snapshot_edges.csv.
+# Needs generated results/snap_optA_nodes.csv and snap_optA_edges.csv.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,7 @@ else
   exit 1
 fi
 
-if [[ ! -f "${repo_root}/results/snapshot_nodes.csv" ]]; then
+if [[ ! -f "${repo_root}/results/snap_optA_nodes.csv" || ! -f "${repo_root}/results/snap_optA_edges.csv" ]]; then
   echo "No snapshot CSVs in ${repo_root}/results/." >&2
   echo "Run tools/generate_snapshot.sh first." >&2
   exit 1

@@ -2,7 +2,7 @@
 # Generate the canonical snap_optA network snapshot from local TLE data.
 #
 # Defaults reproduce the snap_optA dataset used in all reported results:
-#   - 600 satellites, top2_separated shell selection (2 shells, 56 km gap)
+#   - full constellation, top2_separated shell selection (2 shells, ~56 km gap)
 #   - 250 real ground stations (operational_safe CSV)
 #   - 10 epochs at 9-minute steps (81 minutes total)
 #   - Output prefix: results/snap_optA

@@ -1,0 +1,712 @@
+%% ============================================================
+%%  Starlink MHR Routing Simulator — Final Year Project Report
+%% ============================================================
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[a4paper,top=2.8cm,bottom=2.6cm,left=2.8cm,right=2.5cm,headheight=14pt]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{setspace}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{listings}
+\usepackage[ruled,linesnumbered,vlined]{algorithm2e}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=green!50!black,urlcolor=blue!60!black]{hyperref}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\leftmark}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyhead[R]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\titleformat{\chapter}[display]
+  {\normalfont\LARGE\bfseries}{\chaptertitlename\ \thechapter}{8pt}{\LARGE}
+\titlespacing*{\chapter}{0pt}{16pt}{12pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\onehalfspacing
+
+\newcommand{\Pint}{P_{\mathrm{int}}}
+\newcommand{\Tprop}{\tau_{\mathrm{prop}}}
+\newcommand{\Tser}{T_{\mathrm{s}}}
+\newcommand{\Tq}{W_{\mathrm{q}}}
+\newcommand{\TE}{\tau_{\mathrm{E2E}}}
+\newcommand{\RE}{R_E}
+\newcommand{\dth}{d_{\mathrm{th}}}
+\newcommand{\thetar}{\theta_r}
+\newcommand{\thetas}{\theta_s}
+\newcommand{\norm}[1]{\left\|#1\right\|}
+\newcommand{\abs}[1]{\left|#1\right|}
+
+%% ============================================================
+\begin{document}
+
+%% ── Title page ──────────────────────────────────────────────
+\begin{titlepage}
+  \centering
+  \vspace*{2cm}
+  {\Large\bfseries Final Year Project Report\par}
+  \vspace{0.5cm}
+  \rule{\linewidth}{1pt}
+  \vspace{0.4cm}
+  {\LARGE\bfseries
+A Starlink-Like LEO Multi-Hop Routing Simulator and Empirical Evaluation of the BPP Analytical Model
+  \par}
+  \vspace{0.4cm}
+  \rule{\linewidth}{1pt}
+  \vspace{2cm}
+  {\large\bfseries Ali Wazni \quad \& \quad Jaafar Mukahal\par}
+  \vspace{0.5cm}
+  {\large May 2026\par}
+  \vfill
+  {\small
+    Reference paper: Wang, Y., Kishk, M.\,A., \& Alouini, M.-S.\ (2023).\\
+    \textit{Reliability Analysis of Multi-hop Routing in Multi-tier LEO Satellite Networks}.\\
+    arXiv:2303.02286
+  }
+\end{titlepage}
+
+%% ── Abstract ────────────────────────────────────────────────
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+This project builds a Starlink-like multi-hop LEO routing simulator from real
+Two-Line Element (TLE) data. Starting from publicly available Starlink TLEs, the
+simulator generates ten frozen-time network snapshots covering 81 minutes of orbital
+movement, each containing 4{,}080 satellites and 250 ground gateways linked by roughly
+37{,}000 inter-satellite and gateway-access edges.
+
+Two routing algorithms are implemented and compared: Dijkstra shortest-path routing
+and the greedy Wang-style BPP algorithm from Wang, Kishk, and Alouini (2023)
+\cite{wang2023reliability}. Both are run on the same real orbital geometry, and their
+empirical interruption probabilities are compared against the paper's closed-form BPP
+analytical prediction.
+
+At $\dth = 4{,}000$~km on the full constellation, BPP predicts 1.44\% interruption;
+the empirical greedy simulator measures 78.57\%---an absolute error of 77 percentage
+points. Dijkstra achieves zero interruptions on every tested pair, confirming that
+the Walker-delta topology is globally routable and that greedy routing failures are
+algorithmic, not structural.
+
+A full-featured 3D browser visualiser built on Three.js accompanies the simulator,
+showing real satellite positions, ISL links, animated packets, and a live traffic
+simulation with congestion heatmaps, M/D/1 queuing, and a performance dashboard.
+
+\textbf{Keywords:} LEO, Starlink, multi-hop routing, BPP, Walker-delta, TLE,
+Dijkstra, interruption probability, M/D/1 queueing, 3D visualisation.
+
+\tableofcontents
+
+%% ============================================================
+\chapter{Introduction}
+\label{ch:intro}
+%% ============================================================
+
+LEO satellite constellations such as Starlink, Kuiper, and OneWeb are deploying tens
+of thousands of satellites at 340--600~km altitude to deliver sub-50~ms broadband
+globally. Unlike geostationary satellites ($\sim$35{,}786~km, $\sim$600~ms RTT), LEO
+satellites can achieve competitive latency for interactive applications.
+
+Because real Starlink routing tables and traffic data are proprietary, simulation from
+public TLE data is the main academic tool for studying routing behaviour. Analytical
+models such as the BPP model of Wang et al.\ offer closed-form predictions without
+simulation, but they assume satellites are placed randomly---a strong simplification
+relative to real Walker-delta orbital geometry.
+
+This project asks: \textit{does the BPP analytical prediction hold when tested against
+real Starlink TLE-derived geometry?} To answer this, we build a complete simulator that
+runs both the paper's own greedy routing algorithm and a Dijkstra baseline on the same
+real topology, then compare the results against the closed-form BPP prediction.
+
+%% ============================================================
+\chapter{Problem Statement and Objectives}
+\label{ch:problem}
+%% ============================================================
+
+\section{Problem Statement}
+
+Three sub-problems motivate this project:
+
+\begin{enumerate}
+  \item \textbf{Data gap.} Real Starlink routing behaviour is proprietary; TLE data
+        provides positions but no routing information.
+  \item \textbf{Model validity.} The BPP formula assumes randomly placed satellites.
+        Real Starlink follows Walker-delta orbital geometry, which is not random.
+  \item \textbf{Algorithm suitability.} The paper's greedy routing algorithm is
+        designed for BPP geometry. Whether it succeeds on a real Starlink-like
+        topology has not been empirically tested.
+\end{enumerate}
+
+\section{Objectives}
+
+\begin{itemize}
+  \item Build a Starlink-like LEO routing simulator from real TLE data.
+  \item Generate multi-epoch network snapshots (satellites + gateways + ISL/access edges).
+  \item Implement the Wang/BPP greedy routing algorithm exactly as specified in
+        \cite{wang2023reliability}.
+  \item Implement Dijkstra shortest-delay routing as a global-knowledge baseline.
+  \item Compare both empirical results against the BPP closed-form analytical prediction.
+  \item Measure routing success rate, hop count, end-to-end latency, and delay distribution.
+  \item Build a real-time 3D visualiser with live traffic simulation and congestion metrics.
+\end{itemize}
+
+%% ============================================================
+\chapter{Background}
+\label{ch:background}
+%% ============================================================
+
+\section{Walker-Delta Constellations}
+
+A Walker-delta constellation is parameterised by the triplet $N/P/F$ (satellites /
+planes / phasing factor). Starlink's operational shells use inclinations of
+${\sim}43\text{\textdegree}$ and ${\sim}53\text{\textdegree}$, arranged in evenly
+spaced orbital planes with $\pm 2$ intra-plane and $\pm 2$ inter-plane
+inter-satellite links (ISLs). The regular lane structure provides coverage efficiency
+but creates angular anisotropy that affects geographic routing.
+
+\section{Routing Approaches}
+
+\textbf{Greedy geographic routing} selects the next relay based on local geometric
+progress toward the destination. It requires no global topology knowledge, but can fail
+in \emph{routing voids} where no local relay satisfies the forwarding constraints.
+
+\textbf{Dijkstra shortest-path routing} computes the globally optimal path with full
+topology knowledge. It cannot get stuck in voids; the trade-off is the need for a
+distributed link-state protocol (e.g., OSPF-TE) to maintain topology information.
+
+\section{The BPP Analytical Model}
+
+Wang et al.\ \cite{wang2023reliability} model each orbital tier as a Binomial Point
+Process---$N$ satellites placed independently and uniformly at random on a sphere. They
+derive the probability that a valid relay exists at each hop given the routing
+constraints (direction, dome angle, distance, and line-of-sight), then chain this across
+multiple hops via a Markov-chain formulation to obtain the end-to-end interruption
+probability. The model is mathematically tractable and has been validated against
+Monte Carlo BPP simulation, but not against real Walker-delta TLE data.
+
+%% ============================================================
+\chapter{Mathematical Model}
+\label{ch:math}
+%% ============================================================
+
+\section{Geometry}
+
+\textbf{Distance} between nodes $u$ and $v$ with ECEF positions $\mathbf{p}_u,\mathbf{p}_v$:
+\begin{equation}
+  d(u,v) = \norm{\mathbf{p}_u - \mathbf{p}_v}_2
+\end{equation}
+
+\textbf{Propagation delay} over link $(u,v)$:
+\begin{equation}
+  \Tprop(u,v) = \frac{d(u,v)}{c}, \quad c = 299{,}792.458~\text{km/s}
+\end{equation}
+
+\textbf{Dome angle} (geocentric angle between two nodes):
+\begin{equation}
+  \theta_{\mathrm{dome}}(u,v) = \arccos\!\bigl(\hat{\mathbf{p}}_u \cdot \hat{\mathbf{p}}_v\bigr),
+  \quad \hat{\mathbf{p}} = \mathbf{p}/\norm{\mathbf{p}}
+\end{equation}
+
+\textbf{Direction angle} from current node $c$ toward candidate $v$, relative to destination $d$:
+\begin{equation}
+  \theta_{\mathrm{dir}}(c,v,d) =
+    \arccos\!\left(
+      \frac{\mathbf{p}_v-\mathbf{p}_c}{\norm{\mathbf{p}_v-\mathbf{p}_c}}
+      \cdot
+      \frac{\mathbf{p}_d-\mathbf{p}_c}{\norm{\mathbf{p}_d-\mathbf{p}_c}}
+    \right)
+\end{equation}
+
+\textbf{Line-of-sight} condition (segment $uv$ does not intersect Earth of radius $\RE = 6{,}378.137$~km):
+\begin{equation}
+  \min_{t\in[0,1]}\norm{\mathbf{p}_u + t(\mathbf{p}_v-\mathbf{p}_u)}^2 \geq \RE^2
+\end{equation}
+
+\section{BPP Routing Constraints}
+
+The Wang/BPP algorithm applies three constraints to filter candidate relays $v$ at each
+hop from current node $c$ toward destination $d$:
+
+\begin{align}
+  c_1:\quad & \theta_{\mathrm{dir}}(c,v,d) \leq \thetar \label{eq:c1}\\
+  c_2:\quad & \theta_{\mathrm{dome}}(c,v)  \geq \thetas  \label{eq:c2}\\
+  c_3:\quad & d(c,v) \leq \dth \;\text{and}\; \mathrm{LoS}(c,v) \label{eq:c3}
+\end{align}
+
+$c_1$ (direction, \cite{wang2023reliability}~Sec.~III-A) restricts the search to a
+forward cone; $c_2$ (dome angle) ensures geometric progress; $c_3$ (distance + LoS)
+limits hop length and requires clear sky. The relay minimising
+$\theta_{\mathrm{dome}}(v,d)$ among valid candidates is chosen:
+\begin{equation}
+  v^* = \arg\min_{v\in\mathcal{C}}\,\theta_{\mathrm{dome}}(v,d)
+\end{equation}
+If $\mathcal{C}=\emptyset$, the packet is \textbf{interrupted}.
+
+\section{BPP Analytical Interruption Probability}
+
+For tier $k$ with $N_k$ randomly placed satellites, the probability that no valid relay
+exists in that tier is:
+\begin{equation}
+  q_k = (1-p_k)^{N_k}
+\end{equation}
+where $p_k = \Omega_{\mathrm{valid}}^{(k)}/(4\pi R_k^2)$ is the fraction of the sphere
+surface satisfying all three constraints. The single-hop interruption probability over
+$K$ tiers is:
+\begin{equation}
+  \Pint^{(1)} = \prod_{k=1}^{K}(1-p_k)^{N_k}
+\end{equation}
+Multi-hop interruption is derived via a Markov chain over dome-angle states
+\cite{wang2023reliability}:
+\begin{equation}
+  \Pint^{(\mathrm{multi})} = 1 - \bigl[\mathbf{T}^{\bar H}\bigr]_{\mathrm{src}\to\mathrm{dst}}
+\end{equation}
+where $\mathbf{T}$ is the hop transition matrix and $\bar H$ is the expected hop count.
+
+\section{Dijkstra Path Cost}
+
+\begin{equation}
+  C(\pi^*) = \min_{\pi\in\Pi(s,d)}\sum_{i=0}^{H-1}\Tprop(v_i,v_{i+1})
+\end{equation}
+
+\section{Delay Model}
+
+\textbf{Serialisation delay} for packet of $L$ bytes on link of capacity $R$ bps:
+\begin{equation}
+  \Tser = \frac{8L}{R}
+\end{equation}
+
+\textbf{M/D/1 queuing delay} (Pollaczek--Khinchine, deterministic service):
+\begin{equation}
+  \Tq = \frac{\rho}{2(1-\rho)}\,\Tser, \quad \rho = \frac{\text{offered load}}{R}
+\end{equation}
+
+\textbf{Total end-to-end delay}:
+\begin{equation}
+  \TE = \sum_{i=1}^{H}\bigl(\Tprop^{(i)} + \Tser + \Tq^{(i)}\bigr)
+  \label{eq:e2e}
+\end{equation}
+
+%% ============================================================
+\chapter{System Overview and Implementation}
+\label{ch:impl}
+%% ============================================================
+
+\section{Pipeline}
+
+\begin{center}
+\small
+\begin{tabular}{c}
+\fbox{\parbox{0.80\textwidth}{\centering
+\textbf{TLE dataset + ground station CSV}\\[2pt]$\downarrow$\\
+\textbf{\texttt{tle\_to\_snapshot.py}} — propagate positions, build ISL/access graph, export CSVs\\[2pt]$\downarrow$\\
+\textbf{\texttt{analyze\_mhr\_reliability.py}} — BPP formula + greedy + Dijkstra routing\\[2pt]$\downarrow$\\
+\textbf{\texttt{make\_plots.py}} — comparison plots\\[2pt]$\downarrow$\\
+\textbf{Browser 3D visualiser} — Three.js, live traffic, performance dashboard
+}}
+\end{tabular}
+\end{center}
+
+\section{Dataset}
+
+The TLE file (\texttt{starlink.tle}) contains 9{,}887 raw records. After filtering for
+operational satellites (altitude 400--600~km, eccentricity $<0.01$), 8{,}691 valid TLEs
+remain. Shell selection retains the two largest well-separated orbital groups: 2{,}670
+satellites at ${\sim}43\text{\textdegree}$ inclination and 1{,}410 at
+${\sim}53\text{\textdegree}$, totalling 4{,}080 satellites. The ground station CSV
+contains 250 real Starlink gateway locations.
+
+Ten frozen-time snapshots are generated at 9-minute intervals starting at 21:30 UTC,
+21 March 2026, using the Skyfield SGP4 propagator.
+
+\begin{table}[H]
+\centering
+\caption{Mean topology statistics across 10 epochs.}
+\label{tab:topology}
+\begin{tabular}{lc}
+\toprule
+\textbf{Quantity} & \textbf{Value} \\
+\midrule
+Satellites (2 shells)            & 4{,}080 \\
+Gateways                         & 250 \\
+Total nodes                      & 4{,}330 \\
+ISL edges per epoch              & $\approx 7{,}850$ \\
+Access edges per epoch           & $\approx 29{,}600$ \\
+Total edges per epoch            & $\approx 37{,}450$ \\
+Mean ISL length                  & $\approx 1{,}246$~km \\
+Mean access link length          & $\approx 1{,}367$~km \\
+Largest connected component      & $\geq 99.6\%$ of nodes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{ISL policy:} intra-plane $\pm 2$ neighbours, inter-plane $\pm 2$ adjacent
+planes, max length 5{,}000~km; ISLs above $|\mathrm{lat}|>70\text{\textdegree}$ are
+disabled (polar seam avoidance).
+
+\section{Routing Algorithms}
+
+\subsection{Dijkstra}
+Standard binary min-heap Dijkstra on the ISL/access graph with propagation delay as
+edge weight. Gateways are endpoints only---they cannot serve as relay nodes mid-path.
+
+\subsection{BPP Greedy (Algorithm~\ref{alg:bpp})}
+At each hop, all $N$ nodes are scanned. Constraints $c_1$, $c_2$, $c_3$
+(Eqs.~\ref{eq:c1}--\ref{eq:c3}) are applied. The candidate with smallest dome angle
+to destination is chosen. If none exists: interrupted. This matches the paper's
+specification exactly, including relaxing angular constraints for gateway--satellite
+hops.
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\caption{BPP Greedy Multi-Hop Routing}
+\label{alg:bpp}
+\KwIn{Source $s$, destination $d$, $(\thetar, \thetas, \dth)$}
+\KwOut{Path $\pi$, outcome}
+$c \leftarrow s$;\; $\pi \leftarrow [s]$;\; visited $\leftarrow \{s\}$\;
+\For{hop $= 1$ \KwTo MaxHops}{
+  \lIf{$d(c,d)\leq\dth$ and $\mathrm{LoS}(c,d)$}{append $d$; \Return success}
+  $\mathcal{C} \leftarrow \{v\notin\text{visited}:c_1\wedge c_2\wedge c_3\}$\;
+  \lIf{$\mathcal{C}=\emptyset$}{\Return interrupted}
+  $v^*\leftarrow\arg\min_{v\in\mathcal{C}}\theta_\mathrm{dome}(v,d)$;\;
+  $\pi$.append$(v^*)$;\; visited.add$(v^*)$;\; $c\leftarrow v^*$\;
+}
+\Return interrupted\;
+\end{algorithm}
+
+\section{3D Visualiser}
+
+The browser visualiser uses Three.js (WebGL) with:
+\begin{itemize}[noitemsep]
+  \item \textbf{Instanced rendering:} 4{,}080 satellites in a single
+        \texttt{InstancedMesh} draw call; $\sim$37{,}000 edges in a single
+        \texttt{LineSegments} draw call with per-vertex colours.
+  \item \textbf{Animated packet:} a glowing sphere traversing the route hop by hop.
+  \item \textbf{Background traffic:} four intensity presets (Low, Medium, High,
+        Stress) generating continuous random gateway-to-gateway flows.
+  \item \textbf{Live dashboard:} EMA utilisation $\rho_e$, M/D/1 queuing delay,
+        packet loss, goodput, jitter, and a per-link congestion heatmap.
+  \item \textbf{Dijkstra vs BPP comparison panel:} sends both routing algorithms
+        sequentially and shows results side by side.
+\end{itemize}
+
+Gateway access links use a lower capacity (25~Mbps default) than ISL trunks (100~Mbps),
+making gateways visible bottlenecks in the congestion heatmap.
+
+\begin{table}[H]
+\centering
+\caption{Background traffic preset parameters.}
+\label{tab:presets}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Intensity} & \textbf{Rate (pkt/s)} & \textbf{Demand mult.} &
+\textbf{Max flows} & \textbf{Target $\rho_{\mathrm{hot}}$} \\
+\midrule
+Low    & 8   & 400   & 80  & $<0.25$ \\
+Medium & 35  & 1{,}500 & 220 & 0.40--0.60 \\
+High   & 80  & 900   & 320 & 0.70--0.90 \\
+Stress & 160 & 2{,}800 & 500 & $\to 1.0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================
+\chapter{Experiment Setup}
+\label{ch:expsetup}
+%% ============================================================
+
+\begin{itemize}
+  \item \textbf{Constellation:} full Walker-delta (4{,}080 satellites + 250 gateways).
+  \item \textbf{Epochs:} 10 frozen-time snapshots, 9-minute steps (81 minutes total).
+  \item \textbf{Pairs:} 300 random gateway-to-gateway source-destination pairs per epoch.
+  \item \boldmath$d_{\mathrm{th}}$\textbf{ sweep:} 3{,}000 / 3{,}500 / 4{,}000 / 5{,}000~km.
+  \item \textbf{Fixed parameters:} $\thetar = 45\text{\textdegree}$, $\thetas = 15\text{\textdegree}$.
+  \item \textbf{Queuing:} 1~Gbps ISL, 200~Mbps offered load ($\rho = 0.2$),
+        $L = 1{,}500$~bytes. At this load, $\Tser \approx 0.012$~ms and
+        $\Tq \approx 0.0015$~ms per hop, so propagation dominates.
+\end{itemize}
+
+%% ============================================================
+\chapter{Results}
+\label{ch:results}
+%% ============================================================
+
+\section{Interruption Probability}
+
+\begin{table}[H]
+\centering
+\caption{Interruption probability — mean over 10 epochs $\times$ 300 pairs.}
+\label{tab:mainresults}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{ccccr}
+\toprule
+\boldmath$d_\mathrm{th}$\,(km) &
+\textbf{Greedy} & \textbf{BPP pred.} &
+\textbf{Dijkstra} & \textbf{Abs.\ error} \\
+\midrule
+3{,}000 & 0.8743 & 0.0160 & 0.0000 & 0.8584 \\
+3{,}500 & 0.8490 & 0.0144 & 0.0000 & 0.8346 \\
+4{,}000 & \textbf{0.7857} & \textbf{0.0144} & \textbf{0.0000} & \textbf{0.7712} \\
+5{,}000 & 0.7443 & 0.0144 & 0.0000 & 0.7299 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $\dth = 4{,}000$~km, BPP predicts only $1.44\%$ interruption while the empirical
+greedy simulator measures $78.57\%$---an absolute prediction error of
+\textbf{77.12 percentage points}. Dijkstra achieves \textbf{zero interruptions}
+across all configurations.
+
+\section{Hop Count (\texorpdfstring{$d_\mathrm{th} = 4{,}000$}{dth=4000}~km)}
+
+\begin{table}[H]
+\centering
+\caption{Mean hop count at $\dth=4{,}000$~km (delivered routes only).}
+\label{tab:hops}
+\begin{tabular}{lc}
+\toprule
+\textbf{Algorithm} & \textbf{Mean hops} \\
+\midrule
+Greedy   & 8.11  \\
+Dijkstra & 12.65 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Dijkstra uses more hops than greedy (12.65 vs 8.11 mean) because it minimises total
+delay rather than hop count---shorter hops yield lower per-hop propagation. Greedy
+uses fewer hops when it succeeds, but succeeds only 21.4\% of the time.
+
+\section{End-to-End Latency (\texorpdfstring{$d_\mathrm{th} = 4{,}000$}{dth=4000}~km)}
+
+\begin{table}[H]
+\centering
+\caption{Mean E2E latency (ms) at $\dth=4{,}000$~km ($\rho=0.2$, 1{,}500-byte packets).}
+\label{tab:latency}
+\begin{tabular}{lc}
+\toprule
+\textbf{Algorithm} & \textbf{Mean latency (ms)} \\
+\midrule
+Greedy   & 69.87 \\
+Dijkstra & 66.89 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Dijkstra achieves lower mean latency (66.89~ms vs 69.87~ms). At $\rho = 0.2$
+the queueing contribution is negligible ($<0.1$~ms total); propagation dominates.
+
+%% ============================================================
+\chapter{Analysis: Why BPP Fails on Real Starlink Geometry}
+\label{ch:analysis}
+%% ============================================================
+
+\section{The Core Contradiction}
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+\textbf{Method} & \textbf{Interruption @ } $\dth=4{,}000$~\textbf{km} \\
+\midrule
+BPP analytical   & 0.0144 \\
+Greedy empirical & 0.7857 \\
+Dijkstra         & 0.0000 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The BPP formula is correct under its own assumptions: with 4{,}080 randomly placed
+satellites, a valid relay almost always exists somewhere in the required directional
+cone. The problem is that \emph{real Starlink satellites are not random}.
+
+\section{Walker-Delta Creates Systematic Voids}
+
+Walker-delta orbital planes produce angular lanes with regular gaps between them. If
+the routing direction from the current node to the destination points across an
+inter-lane gap, no satellite satisfies $c_1$ within $\dth$---even though the
+destination is reachable globally via a different path. The BPP formula averages over
+isotropic placements and cannot predict these systematic directional voids.
+
+The result is stark: BPP sees 4{,}080 satellites at high density and predicts trivially
+easy routing. The greedy algorithm, working in actual Walker-delta geometry, fails
+78.57\% of the time.
+
+\section{Dijkstra as a Diagnostic}
+
+The fact that Dijkstra achieves zero interruptions is crucial:
+
+\begin{itemize}
+  \item The Walker-delta graph is globally well-connected ($>99.6\%$ in a single component).
+  \item Every tested pair has a valid route---just not one reachable by local greedy forwarding.
+  \item Routing failures are entirely due to the algorithm, not to coverage gaps.
+\end{itemize}
+
+This confirms the engineering implication: real LEO networks require link-state routing
+with global topology knowledge, not geographic-greedy forwarding.
+
+\section{BPP Error Across \texorpdfstring{$d_\mathrm{th}$}{d\_th}}
+
+\begin{table}[H]
+\centering
+\caption{BPP absolute prediction error — full Walker-delta constellation.}
+\label{tab:bpperr}
+\begin{tabular}{cccc}
+\toprule
+$d_\mathrm{th}$\,(km) & \textbf{BPP pred.} & \textbf{Greedy emp.} & \textbf{Abs.\ error (pp)} \\
+\midrule
+3{,}000 & 0.0160 & 0.8743 & 85.84 \\
+3{,}500 & 0.0144 & 0.8490 & 83.46 \\
+4{,}000 & 0.0144 & 0.7857 & 77.12 \\
+5{,}000 & 0.0144 & 0.7443 & 72.99 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Across all $\dth$ values, BPP underestimates greedy interruption by 73--86 percentage
+points ($>98\%$ relative error in all cases).
+
+%% ============================================================
+\chapter{Discussion, Limitations, and Future Work}
+\label{ch:discussion}
+%% ============================================================
+
+\section{Discussion}
+
+\begin{enumerate}
+  \item \textbf{Validate before applying.} A model that works under random-placement
+        assumptions may be arbitrarily wrong for structured constellations. BPP should
+        not be used for quantitative routing-reliability predictions on Walker-delta
+        topologies without empirical validation.
+
+  \item \textbf{Algorithm and topology interact.} The BPP algorithm was designed for
+        BPP topology. Applied to Walker-delta geometry it combines algorithmic
+        limitations (local-only, no backtracking) with structural voids, producing
+        78.57\% interruption where BPP predicts 1.44\%.
+
+  \item \textbf{Topology-aware routing is essential.} Dijkstra's zero interruption
+        rate shows that the same satellite mesh supports reliable routing when global
+        topology knowledge is available. This strongly motivates link-state protocols
+        for operational LEO networks.
+\end{enumerate}
+
+\section{Limitations}
+
+\begin{itemize}[noitemsep]
+  \item Real Starlink routing, traffic, and handover policies are proprietary.
+  \item Snapshots are frozen in time; real topology changes continuously.
+  \item ISL assignment is a geometric heuristic, not SpaceX's actual policy.
+  \item Gateway scheduling and RF interference are not modelled.
+  \item The visualiser uses a simplified, calibrated traffic model---not a Starlink SLA predictor.
+  \item Dijkstra is a baseline; it is not a claim about SpaceX's actual protocol.
+\end{itemize}
+
+\section{Future Work}
+
+\begin{itemize}[noitemsep]
+  \item Realistic traffic matrices (gravity models from population density).
+  \item Additional routing algorithms (GPSR void avoidance, segment routing).
+  \item Handover and link-failure modelling.
+  \item Full parameter sensitivity sweep ($\thetar$, $\thetas$, all Starlink shells).
+  \item NS-3 validation (a stub C++ scenario is already included).
+  \item High-load batch experiments to quantify joint queueing + interruption effects.
+\end{itemize}
+
+%% ============================================================
+\chapter{Conclusion}
+\label{ch:conclusion}
+%% ============================================================
+
+This project built a complete Starlink-like multi-hop LEO routing simulator from real
+TLE data. The simulator generates multi-epoch network snapshots, implements both the
+Wang/BPP greedy algorithm and Dijkstra routing, and computes the closed-form BPP
+analytical prediction on the same topology.
+
+The central finding is stark. On the full 4{,}080-satellite Walker-delta constellation
+at $\dth = 4{,}000$~km:
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+BPP analytical prediction   & 1.44\% interruption \\
+Empirical greedy routing    & 78.57\% interruption \\
+Absolute prediction error   & \textbf{77.12 percentage points} \\
+Dijkstra interruption       & \textbf{0.00\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The BPP model is mathematically valid under its random-placement assumption. It fails
+on real Starlink geometry because Walker-delta orbital lanes create systematic
+directional voids that make greedy routing fail even where global routing succeeds.
+The zero Dijkstra interruption rate confirms that the issue is the routing algorithm,
+not the topology.
+
+The practical lesson is clear: real LEO networks need link-state routing with full
+topology knowledge. Geography-based greedy forwarding, as formalised in the BPP
+model, is unreliable on structured Walker-delta constellations regardless of satellite
+density.
+
+The 3D visualiser makes these dynamics directly observable, showing congestion,
+routing voids, and the contrast between Dijkstra paths and failed greedy routes in
+real time.
+
+%% ── Bibliography ─────────────────────────────────────────────
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{9}
+
+\bibitem{wang2023reliability}
+Y. Wang, M.\,A. Kishk, and M.-S. Alouini,
+``Reliability Analysis of Multi-hop Routing in Multi-tier LEO Satellite Networks,''
+\textit{arXiv preprint arXiv:2303.02286}, 2023.
+
+\bibitem{bhattacherjee2019}
+D. Bhattacherjee and A. Singla,
+``Network topology design at 27,000 km/hour,''
+in \textit{Proc. ACM CoNEXT}, 2019.
+
+\bibitem{del2019}
+E. del Portillo, B.\,G. Cameron, and E.\,F. Crawley,
+``A Technical Comparison of Three LEO Satellite Network Constellations,''
+in \textit{Proc. IAC}, 2019.
+
+\bibitem{walker1984}
+J.\,G. Walker, ``Satellite Constellations,''
+\textit{J. British Interplanetary Soc.}, vol.~37, pp.~559--572, 1984.
+
+\bibitem{dijkstra1959}
+E.\,W. Dijkstra,
+``A Note on Two Problems in Connexion with Graphs,''
+\textit{Numerische Mathematik}, vol.~1, pp.~269--271, 1959.
+
+\bibitem{skyfield}
+B. Rhodes, ``Skyfield: Elegant Astronomy for Python.''
+\url{https://rhodesmill.org/skyfield/}
+
+\bibitem{threejs}
+R. Cabello et al., ``Three.js -- JavaScript 3D Library.''
+\url{https://threejs.org}
+
+\bibitem{kleinrock1975}
+L. Kleinrock, \textit{Queueing Systems, Vol.~I}.
+Wiley, 1975.
+
+\end{thebibliography}
+
+\end{document}

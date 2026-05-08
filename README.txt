@@ -35,12 +35,11 @@ HOW TO RUN
 
     bash tools/run_full_analysis.sh
 
-   Runs BPP analytical + empirical greedy + Dijkstra routing on both the
-   full 4080-satellite snapshot and the 600-satellite subsample, sweeping
-   d_th = 3000, 3500, 4000, 5000 km. Outputs go to:
+   Runs BPP analytical + empirical greedy + Dijkstra routing on the full
+   4080-satellite snapshot, sweeping d_th = 3000, 3500, 4000, 5000 km.
+   Outputs go to:
 
     results/analysis/full/
-    results/analysis/n600/
 
    To run a single configuration instead:
 
@@ -105,7 +104,7 @@ tools/
 
   generate_snapshot.sh
     Wrapper that calls tle_to_snapshot.py with the parameters used for the
-    reported snap_optA dataset (600 kept sats, 250 gateways, 10 epochs).
+    reported snap_optA dataset (4080 sats, 250 gateways, 10 epochs).
 
   analyze_mhr_reliability.py
     Core analysis script. Implements the BPP analytical model from Wang,

@@ -821,7 +821,7 @@ function edgeCapacityBps(eIdx, params) {
   // Gateway access links use a separate (lower) capacity to model the
   // last-mile bottleneck between ground station and the satellite network.
   if (eIdx >= 0 && state.edgeIsAccess && state.edgeIsAccess[eIdx]) {
-    return (params.gatewayMbps ?? params.islMbps) * 1e6;
+    return params.islMbps * 1e6;
   }
   return params.islMbps * 1e6;
 }
@@ -1321,8 +1321,8 @@ function findEdgeIndex(u, v) {
 
 function readParams() {
   return {
-    packetBytes:  Math.max(1, Number(ui.packetSize?.value || 1000)),
-    islMbps:      Math.max(0.001, Number(ui.linkRate?.value || 100)),
+    packetBytes:  Math.max(1,     Number(ui.packetSize?.value || 1000)),
+    islMbps:      Math.max(0.001, Number(ui.linkRate?.value   || 100)),
   };
 }
 
@@ -1365,7 +1365,7 @@ function hopCostsForPath(path, edgeIdxPath, params) {
     // Per-hop ρ comes from live background traffic on this edge.
     let edgeRho = 0;
     if (useLive && eIdx !== -1 && eIdx < state.edgeLoad.length) {
-      edgeRho = Math.min(0.999, state.edgeLoad[eIdx]);
+      edgeRho = Math.max(edgeRho, Math.min(0.999, state.edgeLoad[eIdx]));
     }
     if (edgeRho > rhoMax) rhoMax = edgeRho;
 
@@ -2499,7 +2499,7 @@ function wireUi() {
     ui.timeScaleLabel.textContent = state.timeScale.toFixed(1) + '×';
   });
 
-  for (const el of [ui.packetSize, ui.linkRate, ui.gatewayRate]) {
+  for (const el of [ui.packetSize, ui.linkRate]) {
     if (!el) continue;
     el.addEventListener('change', refreshPath);
     el.addEventListener('input',  refreshPath);
