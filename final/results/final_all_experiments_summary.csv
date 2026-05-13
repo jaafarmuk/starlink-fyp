@@ -1,0 +1,6 @@
+experiment,success_rate,interruption_rate,notes
+"paper_equation_[3, 2, 1]",0.8866342587783391,0.11336574122166089,paper_PM=0.1033
+greedy_random_points,0.7466666666666667,0.25333333333333335,paper constraints on random points
+dijkstra_random_points,0.7466666666666667,0.25333333333333335,"relaxed first hop, then paper constraints"
+greedy_starlink_like_snapshot,0.08,0.92,paper constraints on Starlink-like snapshot
+dijkstra_starlink_like_snapshot,0.29333333333333333,0.7066666666666667,"relaxed first hop, then paper constraints"
